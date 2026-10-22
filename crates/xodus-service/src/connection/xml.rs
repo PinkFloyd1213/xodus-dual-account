@@ -55,7 +55,7 @@ pub async fn parse_message(
             let tokens = context.tokens().resolve(requested)?;
             // Role names only: never account identifiers or token material.
             tracing::info!(
-                message = ?message_type,
+                request = ?message_type,
                 role = tokens.role().as_str(),
                 fallback = tokens.role() != requested,
                 "Issuing credentials"
