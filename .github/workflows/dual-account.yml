@@ -1,0 +1,26 @@
+# Tests of the store/play dual-account branch (Nexus base + dual-account patch).
+name: Dual-account
+
+on:
+  push:
+    branches: [dual-account]
+  pull_request:
+    branches: [dual-account]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev
+      - run: cargo build --locked --release --no-default-features -p xodus-cli -p xodus-service
+      - run: cargo test --locked --no-default-features -p xodus credential_
+      - run: cargo test --locked --no-default-features -p xodus-cli
+      - run: cargo test --locked -p xodus-service store_
