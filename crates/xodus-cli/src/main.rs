@@ -55,6 +55,11 @@ enum SubCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
+    Profile {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Login,
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
@@ -182,6 +187,7 @@ async fn main() -> ExitCode {
     let needs_device_credentials = !matches!(
         args.command,
         SubCommand::Account { .. }
+            | SubCommand::Profile { .. }
             | SubCommand::Clep { .. }
             | SubCommand::SpLicense { .. }
             | SubCommand::Logout { .. }
@@ -238,6 +244,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
         SubCommand::Login => commands::login::run(&client, &tokens).await,
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
