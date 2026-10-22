@@ -79,6 +79,12 @@ enum SubCommand {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Read achievements for one Xbox title without signing in or unlocking anything")]
+    Achievements {
+        title_id: u32,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Read account product entitlements without starting sign-in")]
     Library {
         #[arg(long, default_value_t = false)]
@@ -234,6 +240,7 @@ async fn main() -> ExitCode {
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
             | SubCommand::GameActivity { .. }
+            | SubCommand::Achievements { .. }
             | SubCommand::Library { .. }
             | SubCommand::Clep { .. }
             | SubCommand::SpLicense { .. }
@@ -298,6 +305,7 @@ async fn main() -> ExitCode {
         },
         SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
+        SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
         SubCommand::Login => commands::login::run(&client, &tokens).await,
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
