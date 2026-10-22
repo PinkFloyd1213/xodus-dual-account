@@ -17,12 +17,36 @@ pub trait ExpiringTokenBackend: TokenBackend {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenStoreError {
-    #[error("keychain error: {0}")]
+    #[error("The system keyring could not be accessed. Check that it is running and unlocked.")]
     Keychain(#[from] keyring_core::Error),
-    #[error("io error: {0}")]
+    #[error("Stored Xodus credentials could not be read or saved.")]
     Io(#[from] std::io::Error),
-    #[error("serialization error: {0}")]
+    #[error("Stored Xodus credentials are empty or invalid. Check the system keyring.")]
     Serde(#[from] serde_json::Error),
-    #[error("entry not found")]
+    #[error("Required Xodus credentials are missing. Please sign in again.")]
     NotFound,
+    #[error(
+        "The system keyring did not return the credentials just saved. Check the keyring service before trying sign-in again."
+    )]
+    WriteVerification,
+    #[error("Device authentication did not complete. Check the network connection and try again.")]
+    DeviceAuthentication,
+}
+
+impl TokenStoreError {
+    /// Stable allowlist, never includes provider messages or stored JSON values.
+    pub fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::Keychain(_) => "keyring-unavailable",
+            Self::Io(_) => "credential-io",
+            Self::Serde(_) => "keyring-invalid-data",
+            Self::NotFound => "keyring-missing-data",
+            Self::WriteVerification => "keyring-write-verification",
+            Self::DeviceAuthentication => "device-authentication",
+        }
+    }
+    pub fn report(&self) {
+        eprintln!("NEXUS_CREDENTIAL_ERROR_V1 {}", self.diagnostic_code());
+        eprintln!("{self}");
+    }
 }

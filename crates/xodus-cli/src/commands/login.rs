@@ -12,15 +12,29 @@ const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&ap
 
 pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
     super::subscription::clear();
-    let token = tokens.get_device_sts_token().unwrap();
+    let token = match tokens.get_device_sts_token() {
+        Ok(token) => token,
+        Err(error) => {
+            error.report();
+            return ExitCode::FAILURE;
+        }
+    };
     let secrets::Token::Legacy(token) = token else {
         eprintln!("Invalid STS token");
         return ExitCode::FAILURE;
     };
     let handler = LoginHandler::new(client.clone(), token, tokens.clone());
-    let output = webview::run_sessions(handler)
-        .expect("failed to login")
-        .flatten();
+    let output = match webview::run_sessions(handler) {
+        Ok(output) => output.flatten(),
+        Err(error) => {
+            if let Some(error) = error.downcast_ref::<xodus::tokens::store::TokenStoreError>() {
+                error.report();
+            } else {
+                eprintln!("Sign-in did not complete.");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
     let issued_tokens = match output {
         Some(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => {
             collection.security_tokens
@@ -45,7 +59,10 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         } else {
             address
         };
-        tokens.save_user_token(address, token).unwrap();
+        if let Err(error) = tokens.save_user_token(address, token) {
+            error.report();
+            return ExitCode::FAILURE;
+        }
     }
 
     ExitCode::SUCCESS
@@ -162,12 +179,10 @@ impl webview::SessionHandler for LoginHandler {
             }
             ExchangeUserTokenOutcome::Issued(da) => {
                 runtime.close_session(session_id);
-                self.tokens
-                    .save_user(&xodus::models::secrets::User {
-                        puid: data.puid,
-                        username: data.username,
-                    })
-                    .unwrap();
+                self.tokens.save_user(&xodus::models::secrets::User {
+                    puid: data.puid,
+                    username: data.username,
+                })?;
                 Ok(webview::HandlerControl::Complete(Some(da)))
             }
         }

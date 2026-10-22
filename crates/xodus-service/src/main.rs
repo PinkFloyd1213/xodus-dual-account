@@ -40,13 +40,26 @@ async fn main() {
         registry.init();
     }
 
-    xodus::secrets::init_secrets().expect("Failed to init keychain");
+    if let Err(error) = xodus::secrets::init_secrets() {
+        xodus::tokens::store::TokenStoreError::from(error).report();
+        std::process::exit(1);
+    }
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
-    let xodus::models::secrets::Token::Legacy(device_token) =
-        tokens.get_device_sts_token().unwrap()
-    else {
-        panic!("Device token isnt legacy")
+    if let Err(error) =
+        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await
+    {
+        error.report();
+        std::process::exit(1);
+    }
+    let xodus::models::secrets::Token::Legacy(device_token) = (match tokens.get_device_sts_token() {
+        Ok(token) => token,
+        Err(error) => {
+            error.report();
+            std::process::exit(1);
+        }
+    }) else {
+        xodus::tokens::store::TokenStoreError::DeviceAuthentication.report();
+        std::process::exit(1);
     };
 
     let runtime_dir = utils::get_runtime_dir();
