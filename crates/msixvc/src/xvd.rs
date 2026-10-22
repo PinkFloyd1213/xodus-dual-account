@@ -38,6 +38,10 @@ mod package_metadata_tests;
 #[path = "download_resume_tests.rs"]
 mod resume_tests;
 
+#[cfg(test)]
+#[path = "encrypted_image_tests.rs"]
+mod encrypted_image_tests;
+
 pub struct SyncSubstream<R> {
     inner: R,
     start: u64,
@@ -310,6 +314,19 @@ pub struct SegmentFile {
     pub length: u64,
     pub data_hashs: Vec<[u8; 20]>,
     pub keep_encrypted: bool,
+}
+
+impl SegmentFile {
+    /// Ciphertext is retained as complete XTS data units, including the final
+    /// page beyond the logical file length. Plain files have no such padding.
+    pub fn stored_length(&self) -> io::Result<u64> {
+        if !self.keep_encrypted {
+            return Ok(self.length);
+        }
+        self.length.div_ceil(PAGE_SIZE as u64)
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "encrypted file length overflows"))
+    }
 }
 
 impl XvdFile {
