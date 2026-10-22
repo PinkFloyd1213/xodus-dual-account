@@ -11,6 +11,15 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
+/// Stable digest used for package identity and durable download checkpoints.
+pub fn resume_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
 
@@ -900,7 +909,10 @@ mod tests {
         file.seek(SeekFrom::Start(offset)).await.unwrap();
         let mut tail = [0u8; 4096];
         file.read_exact(&mut tail).await.unwrap();
-        assert_eq!(&tail[..], &body[offset as usize..offset as usize + tail.len()]);
+        assert_eq!(
+            &tail[..],
+            &body[offset as usize..offset as usize + tail.len()]
+        );
 
         file.seek(SeekFrom::Start(0)).await.unwrap();
         let mut head = [0u8; 4096];

@@ -66,6 +66,17 @@ enum SubCommand {
         destination: String,
         #[arg(
             long,
+            help = "Emit Nexus progress protocol v1 as newline-delimited JSON"
+        )]
+        progress_json: bool,
+        #[arg(
+            long,
+            requires = "progress_json",
+            help = "Accept pause/resume JSON commands on stdin"
+        )]
+        control_stdin: bool,
+        #[arg(
+            long,
             default_value_t = false,
             help = "Attempt to skip downloading NTFS metadata to be faste while missing some files"
         )]
@@ -170,7 +181,9 @@ async fn main() -> ExitCode {
     // these fully offline commands were unusable.
     let needs_device_credentials = !matches!(
         args.command,
-        SubCommand::Account { .. } | SubCommand::Clep { .. } | SubCommand::SpLicense { .. }
+        SubCommand::Account { .. }
+            | SubCommand::Clep { .. }
+            | SubCommand::SpLicense { .. }
             | SubCommand::Logout { .. }
     );
     if needs_device_credentials {
@@ -249,6 +262,8 @@ async fn main() -> ExitCode {
         SubCommand::Streaming {
             source,
             destination,
+            progress_json,
+            control_stdin,
             try_skip_ntfs,
             market,
             parallel,
@@ -261,6 +276,8 @@ async fn main() -> ExitCode {
                 try_skip_ntfs,
                 parallel,
                 market,
+                progress_json,
+                control_stdin,
             )
             .await
         }
@@ -272,7 +289,19 @@ async fn main() -> ExitCode {
             materialize_exe,
             materialize_chain,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, materialize_exe, materialize_chain, market).await,
+        } => {
+            commands::run::run(
+                &client,
+                &tokens,
+                source,
+                wine,
+                exe,
+                materialize_exe,
+                materialize_chain,
+                market,
+            )
+            .await
+        }
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,

@@ -9,13 +9,18 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use msixvc::streaming;
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
 use crate::package::{get_content_id, get_packages};
+
+#[path = "streaming_progress.rs"]
+mod progress;
+#[path = "streaming_resume.rs"]
+mod resume;
 
 struct Job {
     name: String,
@@ -28,6 +33,8 @@ enum ProgressEvent {
     Finished { id: usize },
     UpdateRemaining { name: String, total: u64 },
     UpdateStatus { name: String },
+    Paused { paused: bool },
+    Completed { success: bool },
 }
 
 pub async fn run(
@@ -38,8 +45,11 @@ pub async fn run(
     try_skip_ntfs: bool,
     parallel: Option<usize>,
     market: Option<String>,
+    progress_json: bool,
+    control_stdin: bool,
 ) -> ExitCode {
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
+    let pause = progress::controls(control_stdin, tx.clone());
     if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = match File::open(fsrc).await {
@@ -56,7 +66,7 @@ pub async fn run(
                 return ExitCode::FAILURE;
             }
         };
-        run_cli_reader(
+        return run_cli_reader(
             client,
             tokens,
             destination,
@@ -68,6 +78,8 @@ pub async fn run(
             &source,
             &tx,
             rx,
+            progress_json,
+            pause,
         )
         .await;
     } else {
@@ -132,7 +144,7 @@ pub async fn run(
         .expect("ok");
         let l = http_file.len();
 
-        run_cli_reader(
+        return run_cli_reader(
             client,
             tokens,
             destination,
@@ -144,11 +156,11 @@ pub async fn run(
             url,
             &tx,
             rx,
+            progress_json,
+            pause,
         )
         .await;
     }
-
-    ExitCode::SUCCESS
 }
 
 async fn run_cli_reader<Reader>(
@@ -163,11 +175,17 @@ async fn run_cli_reader<Reader>(
     url: &str,
     tx: &Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
-) -> ()
+    progress_json: bool,
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
-    tokio::spawn(async move {
+    let reporter = tokio::spawn(async move {
+        if progress_json {
+            progress::report(rx).await;
+            return;
+        }
         let multi_progress = MultiProgress::new();
         let total_progess = multi_progress.add(ProgressBar::new(l).with_style(
             ProgressStyle::with_template("{msg:30!} {bytes:>12}/{total_bytes:>12} {bytes_per_sec:>12} [{bar:40.cyan/blue}] {percent:>3}%").unwrap()
@@ -205,12 +223,14 @@ where
                 ProgressEvent::UpdateStatus { name } => {
                     total_progess.set_message(name);
                 }
+                ProgressEvent::Paused { .. } => {}
+                ProgressEvent::Completed { .. } => break,
             }
         }
 
         total_progess.abandon();
     });
-    run_reader(
+    let code = run_reader(
         client,
         tokens,
         destination,
@@ -221,8 +241,18 @@ where
         l,
         url,
         tx,
+        pause,
     )
+    .await;
+    tx.send(ProgressEvent::Completed {
+        success: code == ExitCode::SUCCESS,
+    })
     .await
+    .ok();
+    if reporter.await.is_err() {
+        return ExitCode::FAILURE;
+    }
+    code
 }
 
 async fn run_reader<Reader>(
@@ -236,13 +266,21 @@ async fn run_reader<Reader>(
     l: u64,
     url: &str,
     tx: &Sender<ProgressEvent>,
-) -> ()
+    pause: tokio::sync::watch::Receiver<bool>,
+) -> ExitCode
 where
     Reader: AsyncRead + Unpin,
 {
     let out: &Path = Path::new(&destination);
 
     std::fs::create_dir_all(out).expect("ok");
+    let _folder_lock = match resume::lock(out) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Cannot start this download: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
@@ -315,7 +353,7 @@ where
     .await;
     if let Err(err) = license {
         eprintln!("{}", err);
-        return;
+        return ExitCode::FAILURE;
     }
     let (key, game_splicense) = license.unwrap();
     if game_splicense.content_keys.len() != 1 {
@@ -323,15 +361,15 @@ where
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
         );
-        return;
+        return ExitCode::FAILURE;
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return;
+        return ExitCode::FAILURE;
     };
 
     let full_key = content_key.unpack(&key).expect("failed to unpack");
 
-    let total_size = rfiles
+    let total_size: u64 = rfiles
         .iter()
         .filter(|(k, v1)| {
             if let Some(v2) = lfiles.get(*k) {
@@ -343,7 +381,23 @@ where
         .map(|(_, v)| v.length)
         .sum();
 
-    let required_free_space = total_size;
+    let journal = match resume::Journal::open(out, &remote_xvd.resume_identity(), &rfiles) {
+        Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+        Err(error) => {
+            eprintln!("Unable to prepare download checkpoints: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let saved: u64 = rfiles
+        .iter()
+        .filter(|(name, remote)| {
+            lfiles.get(*name).is_none_or(|local| {
+                remote.data_hashs != local.data_hashs || remote.data_hashs.is_empty()
+            })
+        })
+        .map(|(name, file)| journal.lock().unwrap().offset(name, file.length))
+        .sum();
+    let required_free_space = total_size.saturating_sub(saved);
     let available_free_space = match available_space(out) {
         Ok(space) => space,
         Err(err) => {
@@ -352,7 +406,7 @@ where
                 out.display(),
                 err
             );
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
@@ -364,7 +418,7 @@ where
             available_free_space,
             total_size
         );
-        return;
+        return ExitCode::FAILURE;
     }
 
     tx.send(ProgressEvent::UpdateRemaining {
@@ -399,19 +453,37 @@ where
     .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
         let tx = tx.clone();
         let client = client.clone();
+        let mut pause = pause.clone();
+        let journal = journal.clone();
         async move {
-            let target_file = out.join(job.name.replace("\\", "/"));
+            pause.wait_for(|paused| !*paused).await.ok();
+            let target_file = resume::target(out, &job.name).expect("safe download path");
             if let Some(folder) = target_file.parent() {
                 std::fs::create_dir_all(folder).expect("ok");
+            }
+            let mut offset = journal
+                .lock()
+                .unwrap()
+                .offset(&job.name, job.content.length);
+            if url.starts_with("file://") && offset != job.content.length {
+                offset = 0;
             }
             let mut fout = OpenOptions::new()
                 .create(true)
                 .write(true)
-                .truncate(true)
-                .open(target_file)
+                .truncate(false)
+                .open(&target_file)
                 .await
                 .expect("ok");
-            let mut lp = 0;
+            if offset != job.content.length {
+                fout.set_len(offset)
+                    .await
+                    .expect("truncate to durable checkpoint");
+                fout.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .expect("seek checkpoint");
+            }
+            let mut lp = offset;
 
             let progress = |pos, _| {
                 if tx
@@ -425,8 +497,9 @@ where
                 }
             };
             let path = job.name.to_owned();
-            let shown = if path.len() > 30 {
-                format!("...{}", &path[path.len() - 27..])
+            let shown = if path.chars().count() > 30 {
+                let tail: String = path.chars().rev().take(27).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("...{tail}")
             } else {
                 path.clone()
             };
@@ -438,16 +511,46 @@ where
             .await
             .ok();
 
+            tx.send(ProgressEvent::Advanced { id, delta: offset })
+                .await
+                .ok();
+            if offset == job.content.length {
+                tx.send(ProgressEvent::Finished { id }).await.ok();
+                return;
+            }
+            journal
+                .lock()
+                .unwrap()
+                .checkpoint(&job.name, offset)
+                .expect("initial durable checkpoint");
+
             if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await.unwrap();
                 remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
                     .await
                     .expect("msg");
+                use tokio::io::AsyncWriteExt;
+                fout.flush().await.expect("flush extracted file");
+                journal
+                    .lock()
+                    .unwrap()
+                    .checkpoint(&job.name, job.content.length)
+                    .expect("checkpoint extracted file");
                 tx.send(ProgressEvent::Finished { id }).await.ok();
             } else {
                 remote_xvd_ref
-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
+                    .download_file_http(
+                        &client,
+                        url,
+                        &mut fout,
+                        &job.content,
+                        *full_key,
+                        progress,
+                        Some(pause),
+                        offset,
+                        |position| journal.lock().unwrap().checkpoint(&job.name, position),
+                    )
                     .await
                     .expect("msg");
                 tx.send(ProgressEvent::Finished { id }).await.ok();
@@ -456,6 +559,12 @@ where
     })
     .await;
 
+    tx.send(ProgressEvent::UpdateStatus {
+        name: "Finalizing".to_owned(),
+    })
+    .await
+    .ok();
     std::fs::remove_file(&final_path).ok();
     std::fs::rename(&cache_path, &final_path).expect("ok");
+    ExitCode::SUCCESS
 }
