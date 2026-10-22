@@ -19,6 +19,12 @@ mod webview;
 #[derive(Subcommand)]
 enum SubCommand {
     #[cfg(target_os = "linux")]
+    #[command(about = "Gracefully stop only a Nexus-owned session keyring without accessing credentials")]
+    KeyringSessionStop {
+        #[arg(long)]
+        provider_pid: u32,
+    },
+    #[cfg(target_os = "linux")]
     #[command(about = "Unlock the default system wallet without reading credentials or signing in")]
     KeyringUnlock {
         #[arg(long, default_value = "")]
@@ -220,6 +226,12 @@ async fn main() -> ExitCode {
         .unwrap();
     let args = CliArgs::parse();
     #[cfg(target_os = "linux")]
+    if let SubCommand::KeyringSessionStop { provider_pid } = &args.command {
+        let state = xodus::keyring_session::stop_session_provider(*provider_pid);
+        println!("{}", serde_json::json!({"schema": 1, "state": state.as_str()}));
+        return if state == xodus::keyring_session::StopState::Unavailable { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+    }
+    #[cfg(target_os = "linux")]
     if let SubCommand::KeyringUnlock { window_id } = &args.command {
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -275,6 +287,8 @@ async fn main() -> ExitCode {
     }
 
     let code = match args.command {
+        #[cfg(target_os = "linux")]
+        SubCommand::KeyringSessionStop { .. } => unreachable!(),
         #[cfg(target_os = "linux")]
         SubCommand::KeyringUnlock { .. } => unreachable!(),
         SubCommand::ResolvePackage { .. } => unreachable!(),
