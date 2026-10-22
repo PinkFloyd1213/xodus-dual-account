@@ -49,11 +49,17 @@ impl TokenBackend for KeychainBackend {
     }
 
     fn set(&self, key: &str, value: &[u8]) -> Result<(), TokenStoreError> {
-        Ok(crate::secrets::get_entry(key)?.set_secret(&encode_secret(value))?)
+        crate::secrets::get_entry(key)?.set_secret(&encode_secret(value))?;
+        #[cfg(all(target_os = "linux", not(feature = "key-chain-file")))]
+        crate::keyring_persistence::sync_after_write();
+        Ok(())
     }
 
     fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
-        deletion_result(crate::secrets::get_entry(key)?.delete_credential())
+        deletion_result(crate::secrets::get_entry(key)?.delete_credential())?;
+        #[cfg(all(target_os = "linux", not(feature = "key-chain-file")))]
+        crate::keyring_persistence::sync_after_write();
+        Ok(())
     }
 }
 
