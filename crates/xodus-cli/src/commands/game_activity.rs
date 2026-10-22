@@ -24,7 +24,9 @@ fn minutes(value: &Value, xuid: &str, title_id: u32) -> Result<Option<f64>, &'st
             for stat in list["stats"].as_array().ok_or("stats-shape")? {
                 if stat["name"].as_str() != Some("MinutesPlayed") { continue; }
                 if stat["xuid"].as_str() != Some(xuid) { return Err("stats-user"); }
-                let raw = stat["value"].as_str().ok_or("stats-value")?;
+                // A title with no recorded play time omits the value: no data, not an error.
+                let Some(raw) = stat.get("value").filter(|value| !value.is_null()) else { continue; };
+                let raw = raw.as_str().ok_or("stats-value")?;
                 if raw.is_empty() || raw.len() > 32 || !raw.bytes().all(|c| c.is_ascii_digit() || c == b'.') { return Err("stats-value"); }
                 let n = raw.parse::<f64>().map_err(|_| "stats-value")?;
                 if !n.is_finite() || !(0.0..=1_000_000_000.0).contains(&n) { return Err("stats-range"); }
@@ -83,8 +85,11 @@ async fn lookup(tokens: &TokenManager, title_id: u32) -> Result<Value, &'static 
         minutes(&value, &xuid, title_id).map_err(|stage| (stage, status))
     };
     let history = async {
-        let response = client.get(format!("https://titlehub.xboxlive.com/users/xuid({xuid})/titles/titleid({title_id})/decoration/detail"))
+        // Only the titlehistory decoration fills titleHistory; detail leaves it null.
+        let response = client.get(format!("https://titlehub.xboxlive.com/users/xuid({xuid})/titles/titleid({title_id})/decoration/titlehistory"))
             .header("Authorization", &authorization).header("x-xbl-contract-version", "2")
+            // Titlehub answers 400 Bad Request without a language.
+            .header("Accept-Language", "en-US")
             .send().await.map_err(|_| ("request", 0))?;
         let status = response.status().as_u16();
         let bytes = bounded(response, 256 * 1024).await.map_err(|stage| (stage, status))?;
@@ -125,6 +130,14 @@ mod tests {
         assert_eq!(minutes(&root, "123", 42).unwrap(), Some(2052.0));
         let grouped = json!({"groups":[{"titleid":"42","statlistscollection":[list(json!("2052"))]}],"statlistscollection":[list(json!("2052"))]});
         assert_eq!(minutes(&grouped, "123", 42).unwrap(), Some(2052.0));
+    }
+    #[test]
+    fn activity_treats_a_stat_without_value_as_no_data() {
+        let stat = |extra: Value| { let mut s = json!({"name":"MinutesPlayed","xuid":"123"}); s.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); s };
+        for stat in [stat(json!({})), stat(json!({"value": null}))] {
+            let lists = json!({"statlistscollection":[{"arrangebyfield":"xuid","arrangebyfieldid":"123","stats":[stat]}]});
+            assert_eq!(minutes(&lists, "123", 42).unwrap(), None);
+        }
     }
     #[test]
     fn activity_distinguishes_missing_from_real_zero_and_fractions() {
