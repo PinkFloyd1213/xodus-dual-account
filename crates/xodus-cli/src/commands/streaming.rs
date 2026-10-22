@@ -21,6 +21,8 @@ use crate::package::get_packages;
 mod progress;
 #[path = "streaming_resume.rs"]
 mod resume;
+#[path = "streaming_failure.rs"]
+mod failure;
 
 struct Job {
     name: String,
@@ -450,6 +452,7 @@ where
     .ok();
 
     let remote_xvd_ref = &remote_xvd;
+    let (failed, failure_signal) = tokio::sync::watch::channel(false);
     stream::iter(
         rfiles
             .iter()
@@ -471,17 +474,30 @@ where
             })
             .enumerate(),
     )
-    .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
+    .for_each_concurrent(parallel.unwrap_or(4).max(1), |(id, job)| {
         let tx = tx.clone();
         let client = client.clone();
         let mut pause = pause.clone();
         let journal = journal.clone();
+        let failed = failed.clone();
+        let failure_signal = failure_signal.clone();
         async move {
-            pause.wait_for(|paused| !*paused).await.ok();
-            let target_file = resume::target(out, &job.name).expect("safe download path");
-            if let Some(folder) = target_file.parent() {
-                std::fs::create_dir_all(folder).expect("ok");
-            }
+            if *failed.borrow() { return; }
+            let prepared = async {
+                pause.wait_for(|paused| !*paused).await.ok();
+                Ok(())
+            };
+            if failure::run_or_cancel(failure_signal.clone(), prepared).await.is_err() { return; }
+            let opened = async {
+                let target_file = resume::target(out, &job.name)?;
+                if let Some(folder) = target_file.parent() { std::fs::create_dir_all(folder)?; }
+                Ok::<_,failure::Error>(OpenOptions::new().create(true).write(true).truncate(false).open(&target_file).await?)
+            }.await;
+            let mut fout = match opened {
+                Ok(file) => file,
+                Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } return; }
+            };
+            let operation = async {
             let mut offset = journal
                 .lock()
                 .unwrap()
@@ -489,20 +505,10 @@ where
             if url.starts_with("file://") && offset != job.content.length {
                 offset = 0;
             }
-            let mut fout = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&target_file)
-                .await
-                .expect("ok");
             if offset != job.content.length {
-                fout.set_len(offset)
-                    .await
-                    .expect("truncate to durable checkpoint");
+                fout.set_len(offset).await?;
                 fout.seek(std::io::SeekFrom::Start(offset))
-                    .await
-                    .expect("seek checkpoint");
+                    .await?;
             }
             let mut lp = offset;
 
@@ -536,29 +542,18 @@ where
                 .await
                 .ok();
             if offset == job.content.length {
-                tx.send(ProgressEvent::Finished { id }).await.ok();
-                return;
+                return Ok::<(),failure::Error>(());
             }
             journal
                 .lock()
                 .unwrap()
-                .checkpoint(&job.name, offset)
-                .expect("initial durable checkpoint");
+                .checkpoint(&job.name, offset)?;
 
             if let Some(fpath) = url.strip_prefix("file://") {
-                let mut i = File::open(&fpath).await.unwrap();
+                let mut i = File::open(&fpath).await?;
                 remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
-                    .await
-                    .expect("msg");
-                use tokio::io::AsyncWriteExt;
-                fout.flush().await.expect("flush extracted file");
-                journal
-                    .lock()
-                    .unwrap()
-                    .checkpoint(&job.name, job.content.length)
-                    .expect("checkpoint extracted file");
-                tx.send(ProgressEvent::Finished { id }).await.ok();
+                    .await?;
             } else {
                 remote_xvd_ref
                     .download_file_http(
@@ -572,20 +567,29 @@ where
                         offset,
                         |position| journal.lock().unwrap().checkpoint(&job.name, position),
                     )
-                    .await
-                    .expect("msg");
-                tx.send(ProgressEvent::Finished { id }).await.ok();
+                    .await?;
+            }
+            Ok(())
+            };
+            let result = failure::run_or_cancel(failure_signal, operation).await;
+            let result = failure::settle(&mut fout, result, || journal.lock().unwrap().checkpoint(&job.name,job.content.length)).await;
+            match result {
+                Ok(()) => { tx.send(ProgressEvent::Finished { id }).await.ok(); }
+                Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } }
             }
         }
     })
     .await;
 
+    if *failed.borrow() { return ExitCode::FAILURE; }
     tx.send(ProgressEvent::UpdateStatus {
         name: "Finalizing".to_owned(),
     })
     .await
     .ok();
-    std::fs::remove_file(&final_path).ok();
-    std::fs::rename(&cache_path, &final_path).expect("ok");
+    if let Err(error) = failure::finalize(&cache_path, &final_path, false) {
+        failure::report(&error);
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }

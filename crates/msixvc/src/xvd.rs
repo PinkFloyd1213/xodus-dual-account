@@ -5,15 +5,15 @@ use std::io::{self, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use aes::cipher::KeyInit;
 use aes::{Aes128Dec, Aes128Enc};
-use futures_util::StreamExt;
 use msixvc_common::parse::{BinaryParse, BinaryTryParse};
-use reqwest::header::RANGE;
 use tokio::fs::OpenOptions;
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::task::block_in_place;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
+#[cfg(test)]
+use tokio::time::timeout;
 use tokio_util::io::SyncIoBridge;
 use uuid::Uuid;
 use zerocopy::IntoBytes;
@@ -28,6 +28,7 @@ use crate::models::xvd::{
     XvdUserDataPackageFileEntry, XvdUserDataPackageFilesHeader,
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
+use crate::streaming_http::{Policy, RangeReader, TransferError};
 
 #[cfg(test)]
 #[path = "package_metadata_tests.rs"]
@@ -36,33 +37,6 @@ mod package_metadata_tests;
 #[cfg(test)]
 #[path = "download_resume_tests.rs"]
 mod resume_tests;
-
-fn matches_download_range(response: &reqwest::Response, start: u64, end: u64) -> bool {
-    let Some(range) = response
-        .headers()
-        .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("bytes "))
-    else {
-        return false;
-    };
-    let Some((bounds, total)) = range.split_once('/') else {
-        return false;
-    };
-    let Some((first, last)) = bounds.split_once('-') else {
-        return false;
-    };
-    match (
-        first.parse::<u64>(),
-        last.parse::<u64>(),
-        total.parse::<u64>(),
-    ) {
-        (Ok(first), Ok(last), Ok(total)) => {
-            first == start && last >= first && last <= end && total > last
-        }
-        _ => false,
-    }
-}
 
 pub struct SyncSubstream<R> {
     inner: R,
@@ -891,39 +865,12 @@ impl XvdFile {
         let mut remaining = sfile.length - resume_offset;
         let mut page_in_section = page_start + resume_offset / PAGE_SIZE as u64;
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
-        let mut stream = None;
         let mut pending = bytes::BytesMut::new();
         let mut v: u64 = resume_offset;
         let mut last_checkpoint = resume_offset;
-        let mut retries = 0;
-
-        let stall_timeout = tokio::time::Duration::from_secs(5);
-        if let Ok(Ok(Ok(response))) = timeout(
-            stall_timeout,
-            client
-                .get(url)
-                .header(
-                    RANGE,
-                    format!(
-                        "bytes={}-{}",
-                        sfile.offset + v,
-                        sfile.offset + page_length - 1
-                    ),
-                )
-                .send(),
-        )
-        .await
-        .map(|o| o.map(|o| o.error_for_status()))
-            && response.status() == 206
-        {
-            if !matches_download_range(&response, sfile.offset + v, sfile.offset + page_length - 1)
-            {
-                return Err(Box::new(io::Error::other(
-                    "invalid HTTP Content-Range; checkpoint preserved",
-                )));
-            }
-            stream = Some(response.bytes_stream());
-        }
+        let start = sfile.offset.checked_add(v).ok_or(TransferError::new("transfer-range", 0))?;
+        let end = sfile.offset.checked_add(page_length - 1).ok_or(TransferError::new("transfer-range", 0))?;
+        let mut transfer = RangeReader::new(client, url, start, end, Policy::default());
         loop {
             if page_in_section >= page_start + page_count || remaining == 0 {
                 break;
@@ -932,73 +879,36 @@ impl XvdFile {
                 if *control.borrow() {
                     // Release the HTTP connection while parked. Resuming issues
                     // a fresh Range request at v, preserving pending partial pages.
-                    stream = None;
+                    transfer.disconnect();
                     out.flush().await?;
                     checkpoint(sfile.length - remaining)?;
                     control.wait_for(|paused| !*paused).await.ok();
+                    // Time spent intentionally paused is not a network stall.
+                    transfer.disconnect();
                 }
             }
-            let next = if let Some(s) = stream.as_mut() {
-                if let Some(control) = pause.as_mut() {
-                    tokio::select! {
-                        biased;
-                        changed = control.changed() => {
-                            if changed.is_err() { pause = None; }
-                            continue;
-                        }
-                        next = timeout(stall_timeout, s.next()) => next,
+            let next = if let Some(control) = pause.as_mut() {
+                tokio::select! {
+                    biased;
+                    changed = control.changed() => {
+                        if changed.is_err() { pause = None; }
+                        continue;
                     }
-                } else {
-                    timeout(stall_timeout, s.next()).await
+                    next = transfer.next() => next,
                 }
             } else {
-                Ok(None)
+                transfer.next().await
             };
-            let data;
-            if let Ok(Some(Ok(b))) = next {
-                data = b;
-            } else {
-                // error
-                retries += 1;
-                if retries > 8 {
-                    return Err(Box::new(io::Error::other(
-                        "download stalled; retry to refresh the package URL and resume its checkpoints",
-                    )));
+            let data = match next {
+                Ok(Some(data)) => data,
+                result => {
+                    // Only fully written pages become durable, never a pending
+                    // partial encrypted page or merely reported progress.
+                    out.flush().await?;
+                    checkpoint(sfile.length - remaining)?;
+                    return Err(Box::new(result.err().unwrap_or(TransferError::new("transfer-eof", 0))));
                 }
-                if let Ok(Ok(Ok(response))) = timeout(
-                    stall_timeout,
-                    client
-                        .get(url)
-                        .header(
-                            RANGE,
-                            format!(
-                                "bytes={}-{}",
-                                sfile.offset + v,
-                                sfile.offset + page_length - 1
-                            ),
-                        )
-                        .send(),
-                )
-                .await
-                .map(|o| o.map(|o| o.error_for_status()))
-                    && response.status() == 206
-                {
-                    if !matches_download_range(
-                        &response,
-                        sfile.offset + v,
-                        sfile.offset + page_length - 1,
-                    ) {
-                        return Err(Box::new(io::Error::other(
-                            "invalid HTTP Content-Range; checkpoint preserved",
-                        )));
-                    }
-                    stream = Some(response.bytes_stream());
-                    continue;
-                }
-                continue;
-            }
-
-            retries = 0;
+            };
             if data.len() as u64 > page_length - v {
                 return Err(Box::new(io::Error::other(
                     "HTTP range exceeded the requested segment",
@@ -1046,11 +956,7 @@ impl XvdFile {
                 } else {
                     to_write_remaining
                 };
-                while let Err(err) = out.write_all(&page[..to_write]).await {
-                    eprintln!("Error write file {} waiting 30s", err);
-                    println!("Error write file {} waiting 30s", err);
-                    sleep(tokio::time::Duration::from_secs(30)).await;
-                }
+                out.write_all(&page[..to_write]).await?;
                 remaining -= to_write_remaining as u64;
 
                 page_in_section += 1;
