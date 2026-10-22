@@ -262,6 +262,21 @@ demande `webkit2gtk4.1-devel`, à installer avec sudo).
 - un STS `play` rafraîchi ne touche pas `store` ; un rafraîchissement en
   repli reste dans `store` et ne crée pas de compte `play`.
 
+**Activité Xbox (corrigé le 22.10.2026, hors double compte)** : la date de
+dernière partie restait indisponible et la fiche affichait « Some Xbox activity
+could not be retrieved ». Il y avait deux causes.
+
+- **Requête titlehub mal formée.** Elle utilisait la décoration `detail`, qui
+  laisse `titleHistory` à `null`, et n'envoyait pas d'`Accept-Language`, ce
+  qui provoque un HTTP 400. La requête utilise maintenant la décoration
+  `titlehistory` et envoie la langue.
+- **Statistique sans valeur rejetée.** userstats omet la valeur de
+  `MinutesPlayed` pour un jeu sans temps enregistré. Le parseur traitait ce
+  cas comme une erreur ; c'est maintenant « pas de donnée ».
+
+`NEXUS_ACTIVITY_DIAGNOSTIC_V1 <stats|title>-<étape> <statut HTTP>` (stderr)
+indique désormais quelle lecture échoue.
+
 **Vérifications** (rustc 1.99.0)
 
 - La séquence complète de `cargo test` de `build-backend.mjs`, plus
@@ -283,10 +298,10 @@ résultat est identique à `dual-account`. Entrée à ajouter **en dernier** dan
 `patches` :
 
 ```json
-{ "file": "xodus-dual-account.patch", "sha256": "7356975ce87256303bfdd38f5c8e77a75ca50626210b82157ecb3dfd992b8ce8" }
+{ "file": "xodus-dual-account.patch", "sha256": "f67a556fba4eb5ca6bd0466bb878d4d1a3aabe0aef7b534232960e2cc3b363b6" }
 ```
 
-C'est fait dans le fork Nexus, avec `patchId` = `linux-run-v38-dual-account-1`.
+C'est fait dans le fork Nexus, avec `patchId` = `linux-run-v38-dual-account-N` (incrémenté à chaque nouveau patch).
 Le `patchId` identifie la recette. `compatibility` reste à
 `linux-run-v22`, puisque le contrat de lancement ne change pas. Avec ça,
 **Rebuild** construit un backend managed qui peut lancer les jeux.
