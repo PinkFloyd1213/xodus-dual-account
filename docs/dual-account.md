@@ -1,356 +1,357 @@
-# Deux comptes : `store` (licence) et `play` (identité en jeu)
+# Two accounts: `store` (licenses) and `play` (in-game identity)
 
-> **Statut : backend et fork Nexus implémentés et testés** (branches
-> `dual-account` des deux forks). Reste le test manuel en jeu avec les vrais
-> comptes (plan en fin de document). Guide d'utilisation : `docs/DUAL_ACCOUNT.md`
-> du fork Nexus.
+> **Status: backend and Nexus fork implemented, tested and in use**
+> (`dual-account` branches of both forks). Verified in game on 22.10.2026:
+> `MsaTokenRequest` uses `play`, cloud saves sync for the personal account,
+> achievements and time played follow it. User guide: `docs/DUAL_ACCOUNT.md`
+> in the Nexus fork.
 >
-> Objectif : reproduire Windows. Le compte qui a le Game Pass (`store`) ne sert
-> qu'aux licences, en arrière-plan, comme le Microsoft Store. Tout ce que
-> l'utilisateur voit (identité en jeu, gamertag, succès, temps de jeu, cloud
-> saves), en jeu comme dans le launcher, est le compte perso (`play`), comme
-> l'app Xbox.
+> Goal: reproduce Windows. The account that has Game Pass (`store`) is used
+> only for licenses, in the background, like the Microsoft Store. Everything
+> the user sees (in-game identity, gamertag, achievements, playtime, cloud
+> saves), both in game and in the launcher, is the personal account (`play`),
+> like the Xbox app.
 >
-> Maintenu comme forks ([xodus-dual-account](https://github.com/PinkFloyd1213/xodus-dual-account),
+> Maintained as forks ([xodus-dual-account](https://github.com/PinkFloyd1213/xodus-dual-account),
 > [xodus-nexus-dual-account](https://github.com/PinkFloyd1213/xodus-nexus-dual-account)),
-> mais écrit pour rester fusionnable : changements additifs, aucun refactoring,
-> comportement identique tant qu'aucun compte `play` n'est configuré.
+> but written to stay mergeable: additive changes, no refactoring, identical
+> behavior as long as no `play` account is configured.
 
-## Base de travail
+## Baseline
 
-| Élément | Valeur |
+| Item | Value |
 |---|---|
-| Nexus lu | `domsvoboda/xodus-nexus` @ `59fb0798f034` (21.10.2026) |
-| Lock backend | version `0.2.10`, commit `53ea781dcd07`, patchId `linux-run-v38`, compatibility `linux-run-v22`, rust `1.99.0` |
-| `Cargo.lock` | sha256 conforme au lock (`2259b343…`) |
-| Branche `nexus-base` | commit fixé + 38 patches du lock, appliqués dans l'ordre (`git apply --check` puis `git apply`, comme `backend.ts` et `scripts/build-backend.mjs`), un commit par patch, sha256 vérifié pour chacun |
-| Build | `cargo build --locked --release --no-default-features -p xodus-cli -p xodus-service` avec rustc 1.99.0 : OK |
-| Capacités | `--help` expose tout ce que `parseBackendHelp`/`validate()` et `build-backend.mjs` attendent (account, profile, game-activity, achievements, library, login, logout, download, streaming, run, resolve-package, keyring-*, `--external-webview-stdio`, `--progress-json`, `--control-stdin`, `--download-limit-kib`, `--selected-content-id`, `run --materialize-chain`). Aucune librairie webview native liée. |
+| Nexus read | `domsvoboda/xodus-nexus` @ `59fb0798f034` (21.10.2026) |
+| Backend lock | version `0.2.10`, commit `53ea781dcd07`, patchId `linux-run-v38`, compatibility `linux-run-v22`, rust `1.99.0` |
+| `Cargo.lock` | sha256 matches the lock (`2259b343…`) |
+| `nexus-base` branch | pinned commit + the 38 patches from the lock, applied in order (`git apply --check` then `git apply`, like `backend.ts` and `scripts/build-backend.mjs`), one commit per patch, sha256 verified for each |
+| Build | `cargo build --locked --release --no-default-features -p xodus-cli -p xodus-service` with rustc 1.99.0: OK |
+| Capabilities | `--help` exposes everything `parseBackendHelp`/`validate()` and `build-backend.mjs` expect (account, profile, game-activity, achievements, library, login, logout, download, streaming, run, resolve-package, keyring-*, `--external-webview-stdio`, `--progress-json`, `--control-stdin`, `--download-limit-kib`, `--selected-content-id`, `run --materialize-chain`). No native webview library linked. |
 
-Remarque : le lock ne contient **pas** de `LINUX_RUN_PATCH` séparé.
-`LINUX_RUN_PATCH` est simplement `lock.compatibility` (`linux-run-v22`) ; le
-« patch linux-run » est `xodus-linux-run.patch`, le premier de la liste.
+Note: the lock does **not** contain a separate `LINUX_RUN_PATCH`.
+`LINUX_RUN_PATCH` is simply `lock.compatibility` (`linux-run-v22`); the
+"linux-run patch" is `xodus-linux-run.patch`, the first one in the list.
 
-## Stockage actuel (état patché)
+## Current storage (patched state)
 
-`TokenManager` (`crates/xodus/src/tokens/manager.rs`) écrit dans le trousseau
-Secret Service, collection/service `Xodus Service`, sous ces clés :
+`TokenManager` (`crates/xodus/src/tokens/manager.rs`) writes to the Secret
+Service keyring, collection/service `Xodus Service`, under these keys:
 
-| Clé | Contenu | Rôle |
+| Key | Content | Role |
 |---|---|---|
-| `user-session` | compte + jeu complet de STS (format écrit par `login` depuis `xodus-keyring-credentials`) | utilisateur |
-| `user-tokens`, `user-DA` | ancien format éclaté, encore lu si `user-session` est absent | utilisateur |
-| `device-tokens` | STS appareil | appareil |
-| `dev_license` | identité + licence appareil | appareil |
-| `nexus-subscription-v2` | cache 10 min de l'abonnement, lié au `username` (`commands/subscription.rs`) | `store` |
+| `user-session` | account + full set of STS (format written by `login` from `xodus-keyring-credentials`) | user |
+| `user-tokens`, `user-DA` | old split format, still read if `user-session` is absent | user |
+| `device-tokens` | device STS | device |
+| `dev_license` | device identity + license | device |
+| `nexus-subscription-v2` | 10-min subscription cache, tied to `username` (`commands/subscription.rs`) | `store` |
 
-Le cache XSTS éphémère (`get_cached_xsts`/`cache_xsts`, en mémoire) n'a
-**aucun appelant** aujourd'hui.
+The ephemeral XSTS cache (`get_cached_xsts`/`cache_xsts`, in memory) has
+**no callers** today.
 
-## Ce que le jeu envoie au service
+## What the game sends to the service
 
-Le runtime Wine de Nexus (`assets/xgameruntime-*.patch`) n'envoie que quatre
-messages à `xodus-service` (`crates/xodus/proto/xodus/common.proto`) :
+The Nexus Wine runtime (`assets/xgameruntime-*.patch`) sends only four
+messages to `xodus-service` (`crates/xodus/proto/xodus/common.proto`):
 `PING`, `MSA_TOKEN_REQUEST`, `STORE_LICENSE_TOKEN_REQUEST`,
-`STORE_PACKAGE_UPDATES_REQUEST`. Le chemin protobuf est `unimplemented!`.
+`STORE_PACKAGE_UPDATES_REQUEST`. The protobuf path is `unimplemented!`.
 
-Tout le reste est fait **dans le runtime** à partir du token renvoyé par
-`MSA_TOKEN_REQUEST` : XUser, XSTS des services de jeu, cloud saves
+Everything else is done **in the runtime** from the token returned by
+`MSA_TOKEN_REQUEST`: XUser, game-service XSTS, cloud saves
 (`titlestorage.xboxlive.com/connectedstorage/users/xuid(...)`, via
-`xuser_device_authorization`), gamerpic, etc. Router `MSA_TOKEN_REQUEST` vers
-`play` suffit donc à faire passer **toute** l'identité en jeu par `play`.
+`xuser_device_authorization`), gamerpic, etc. Routing `MSA_TOKEN_REQUEST` to
+`play` is therefore enough to route the **entire** in-game identity through `play`.
 
-Les API XStore du runtime (`xstore_entitled.h`, `xstore_receipts.h`,
-licence de package) ne passent **que** par `STORE_LICENSE_TOKEN_REQUEST`. Elles
-lisent l'XUID de l'XUser mais ne l'envoient pas au service. Le patch le dit
-explicitement : *« The existing receipt transport uses the service's
-authenticated Store account, not Xbox profile metadata. »*
+The runtime's XStore APIs (`xstore_entitled.h`, `xstore_receipts.h`,
+package license) go **only** through `STORE_LICENSE_TOKEN_REQUEST`. They
+read the XUID from the XUser but do not send it to the service. The patch says
+so explicitly: *"The existing receipt transport uses the service's
+authenticated Store account, not Xbox profile metadata."*
 
-## Cartographie
+## Map
 
-Chemins relatifs à `crates/`. Lignes dans l'état `nexus-base`.
+Paths relative to `crates/`. Line numbers as of `nexus-base`.
 
-### Modèle (`xodus`)
+### Model (`xodus`)
 
-| Emplacement | Fonction | Rôle proposé | Justification |
+| Location | Function | Proposed role | Rationale |
 |---|---|---|---|
-| `xodus/src/tokens/manager.rs:10-16` | clés du trousseau | `store` = clés actuelles ; `play` = `play/user-session` (+ `play/user-tokens`, `play/user-DA` pour symétrie) | aucune migration ; l'existant devient `store` |
-| `manager.rs:65` | `remove_persistent` | `store` (+ `device-tokens`, comme aujourd'hui) | comportement actuel de `logout` |
-| `manager.rs:76-109` | device license / device STS | appareil, partagé | un seul appareil, comme sous Windows |
-| `manager.rs:113` `:120` `:132` | `get_user_token_for`, `save_user_token`, `get_user_sts_token` | paramétrés par rôle | cœur du changement |
-| `manager.rs:139` `:150` `:158` `:168` | `get_user`, `save_user`, `user_session`, `save_user_session` | paramétrés par rôle | idem |
-| `manager.rs:186-205` | cache XSTS éphémère | inchangé | pas d'appelant ; s'il en a un un jour, la clé doit inclure le rôle (noté en commentaire) |
-| `xodus/src/tokens/device.rs:12` `:36` | `ensure_device_credentials`, `refresh_existing_device_credentials` | appareil | n'utilisent pas de compte |
-| `xodus/src/auth.rs:70-187` | `do_sisu` (lit puis réécrit le STS utilisateur, `:83`, `:149`) | inchangé (`store`) | seul appelant : un test `#[ignore]` ; ne pas l'étendre (diff minimal) |
-| `xodus/src/auth.rs:32` `:49` `:62` | `start_new_session`, `get_xsts_token`, `refresh_tokens` | n/a | ne touchent pas au `TokenManager`, aucun appelant |
-| `xodus/src/licensing/content.rs:19` `:62` | `get_license_content`, `get_license_token` | `store` (par l'appelant) | reçoivent les tokens en paramètre |
+| `xodus/src/tokens/manager.rs:10-16` | keyring keys | `store` = current keys; `play` = `play/user-session` (+ `play/user-tokens`, `play/user-DA` for symmetry) | no migration; the existing data becomes `store` |
+| `manager.rs:65` | `remove_persistent` | `store` (+ `device-tokens`, as today) | current `logout` behavior |
+| `manager.rs:76-109` | device license / device STS | device, shared | a single device, as on Windows |
+| `manager.rs:113` `:120` `:132` | `get_user_token_for`, `save_user_token`, `get_user_sts_token` | parameterized by role | core of the change |
+| `manager.rs:139` `:150` `:158` `:168` | `get_user`, `save_user`, `user_session`, `save_user_session` | parameterized by role | same |
+| `manager.rs:186-205` | ephemeral XSTS cache | unchanged | no callers; if it ever gets one, the key must include the role (noted in a comment) |
+| `xodus/src/tokens/device.rs:12` `:36` | `ensure_device_credentials`, `refresh_existing_device_credentials` | device | do not use an account |
+| `xodus/src/auth.rs:70-187` | `do_sisu` (reads then rewrites the user STS, `:83`, `:149`) | unchanged (`store`) | only caller: an `#[ignore]` test; do not extend it (minimal diff) |
+| `xodus/src/auth.rs:32` `:49` `:62` | `start_new_session`, `get_xsts_token`, `refresh_tokens` | n/a | do not touch the `TokenManager`, no callers |
+| `xodus/src/licensing/content.rs:19` `:62` | `get_license_content`, `get_license_token` | `store` (via the caller) | receive the tokens as parameters |
 
 ### Service (`xodus-service`)
 
-| Emplacement | Fonction | Rôle proposé | Justification |
+| Location | Function | Proposed role | Rationale |
 |---|---|---|---|
-| `xodus-service/src/main.rs:47-63` | `ensure_device_credentials` + device STS au démarrage | appareil | |
-| `connection/xml.rs:52-138` (`:57` lecture, `:115` écriture) | `MsaTokenRequest` (XUser, `xgameruntime.dll`) | **`play`**, repli `store` ; le STS rafraîchi est réécrit dans le rôle **effectivement lu** | identité en jeu ; tous les XSTS de jeu, cloud saves, succès, présence en découlent |
-| `connection/xml.rs:47` → `store_license.rs:57-99` (`:59` STS, `:60` compte) | `StoreLicenseTokenRequest` (XStore : entitlements, DLC, reçus, licence de package) | **`store`** | Sous Windows, XStore utilise le compte du Microsoft Store. Le runtime n'envoie pas l'XUID. Voir l'ambiguïté A2. |
-| `connection/xml.rs:43` → `store_updates.rs:282-333` (`:304`) | `StorePackageUpdatesRequest` (XSTS `update.xboxlive.com` → `GetBasePackage`) | **`store`** | accès au package = droit du compte qui possède le jeu |
+| `xodus-service/src/main.rs:47-63` | `ensure_device_credentials` + device STS at startup | device | |
+| `connection/xml.rs:52-138` (`:57` read, `:115` write) | `MsaTokenRequest` (XUser, `xgameruntime.dll`) | **`play`**, fallback `store`; the refreshed STS is written back to the role **actually read** | in-game identity; all game XSTS, cloud saves, achievements, presence derive from it |
+| `connection/xml.rs:47` → `store_license.rs:57-99` (`:59` STS, `:60` account) | `StoreLicenseTokenRequest` (XStore: entitlements, DLC, receipts, package license) | **`store`** | On Windows, XStore uses the Microsoft Store account. The runtime does not send the XUID. See ambiguity A2. |
+| `connection/xml.rs:43` → `store_updates.rs:282-333` (`:304`) | `StorePackageUpdatesRequest` (XSTS `update.xboxlive.com` → `GetBasePackage`) | **`store`** | package access = entitlement of the account that owns the game |
 | `connection/proto.rs:4` | protobuf | n/a | `unimplemented!` |
-| `connection/router.rs`, `simple_context.rs` | contexte | portent un `TokenManager` partagé, pas de changement de structure | |
+| `connection/router.rs`, `simple_context.rs` | context | carry a shared `TokenManager`, no structural change | |
 
 ### CLI (`xodus-cli`)
 
-| Emplacement | Fonction | Rôle proposé | Justification |
+| Location | Function | Proposed role | Rationale |
 |---|---|---|---|
-| `main.rs:273` | construction du `TokenManager` | inchangé | |
-| `main.rs:327-354` | `account [--json]` | `store` par défaut ; `--account play` ; champ optionnel `roles` en JSON (voir le design) | Nexus lit `stored` / `username` (`account-refresh.ts`) |
-| `main.rs:358` + `commands/login.rs:13-79` (`:14` cache abo, `:15` device, `:73` save) | `login` | `store` par défaut (Nexus, `externalAuth` inchangés) ; `--account play` | `play` n'efface pas le cache d'abonnement |
-| `main.rs:359` + `commands/logout.rs:4-15` | `logout [--device]` | voir l'ambiguïté A5 | |
-| `license.rs:7-98` (`:13` device, `:19-21` compte + STS) | `get_license` (licence de contenu, clés de déchiffrement) | **`store`** | appelé par `streaming` (`commands/streaming.rs:422`), `run` (`commands/run.rs:508`), `license`, `extract` |
-| `license.rs:100-118` | `license_material` (device license) | appareil | |
+| `main.rs:273` | `TokenManager` construction | unchanged | |
+| `main.rs:327-354` | `account [--json]` | `store` by default; `--account play`; optional `roles` field in JSON (see the design) | Nexus reads `stored` / `username` (`account-refresh.ts`) |
+| `main.rs:358` + `commands/login.rs:13-79` (`:14` subscription cache, `:15` device, `:73` save) | `login` | `store` by default (Nexus, `externalAuth` unchanged); `--account play` | `play` does not clear the subscription cache |
+| `main.rs:359` + `commands/logout.rs:4-15` | `logout [--device]` | see ambiguity A5 | |
+| `license.rs:7-98` (`:13` device, `:19-21` account + STS) | `get_license` (content license, decryption keys) | **`store`** | called by `streaming` (`commands/streaming.rs:422`), `run` (`commands/run.rs:508`), `license`, `extract` |
+| `license.rs:100-118` | `license_material` (device license) | device | |
 | `package.rs:18-59` (`:23` device, `:27` STS) | `get_packages` (XSTS `update.xboxlive.com`) | **`store`** | `download` (`commands/download.rs:30`), `streaming` (`:145`) |
-| `commands/library.rs:99-160` | `library` (entitlements `beige.xboxservices.com`) | **`store`** | bibliothèque / Game Pass |
-| `commands/subscription.rs:100-221` | `store_session`, abonnement + cache | **`store`** | Game Pass |
-| `commands/run.rs:27-37`, `:657-659` | `playfab_auth_header` → `XODUS_XSTS_PLAYFAB` passé au jeu | **`play`** | XSTS PlayFab = identité du joueur |
-| `commands/run.rs:508` | `get_license` au lancement | **`store`** | licence |
-| `commands/session.rs:16-84` | `prepare` (STS + device, contrôle « account-changed ») | rôle de l'appelant | helper générique |
-| `commands/profile.rs:49-73` | `xbox_session` (XSTS `xboxlive.com`) | rôle de l'appelant | helper |
-| `commands/profile.rs:75-112` | `profile --json` : gamertag/gamerpic + abonnement | **ambigu (A1)** : gamertag `play`, abonnement `store` | |
-| `commands/game_activity.rs:61-104` | `game-activity` | **ambigu (A1)** | donnée du joueur |
-| `commands/achievements.rs:89-128` | `achievements` | **ambigu (A1)** | donnée du joueur |
-| `commands/clep.rs`, `splicense.rs`, `extract_eappx.rs`, `resolve-package`, `keyring-*` | | aucun compte | |
+| `commands/library.rs:99-160` | `library` (entitlements `beige.xboxservices.com`) | **`store`** | library / Game Pass |
+| `commands/subscription.rs:100-221` | `store_session`, subscription + cache | **`store`** | Game Pass |
+| `commands/run.rs:27-37`, `:657-659` | `playfab_auth_header` → `XODUS_XSTS_PLAYFAB` passed to the game | **`play`** | PlayFab XSTS = player identity |
+| `commands/run.rs:508` | `get_license` at launch | **`store`** | license |
+| `commands/session.rs:16-84` | `prepare` (STS + device, "account-changed" check) | caller's role | generic helper |
+| `commands/profile.rs:49-73` | `xbox_session` (XSTS `xboxlive.com`) | caller's role | helper |
+| `commands/profile.rs:75-112` | `profile --json`: gamertag/gamerpic + subscription | **ambiguous (A1)**: gamertag `play`, subscription `store` | |
+| `commands/game_activity.rs:61-104` | `game-activity` | **ambiguous (A1)** | player data |
+| `commands/achievements.rs:89-128` | `achievements` | **ambiguous (A1)** | player data |
+| `commands/clep.rs`, `splicense.rs`, `extract_eappx.rs`, `resolve-package`, `keyring-*` | | no account | |
 
-## Cas ambigus et points à trancher
+## Ambiguous cases and open decisions
 
-**A1 — `profile`, `achievements` et `game-activity` vus par Nexus (décision requise).**
-Nexus rejette toute réponse dont `account` diffère du `username` renvoyé par
-`account --json` : voir `game-achievements.ts:19`, `game-activity.ts:42`,
-`account-profile.ts:90` et `account-library.ts:22`. Ces commandes ne sont pas
-vues par le jeu, seulement par l'interface Nexus.
+**A1 — `profile`, `achievements` and `game-activity` as seen by Nexus (decision required).**
+Nexus rejects any response whose `account` differs from the `username` returned
+by `account --json`: see `game-achievements.ts:19`, `game-activity.ts:42`,
+`account-profile.ts:90` and `account-library.ts:22`. These commands are not
+seen by the game, only by the Nexus UI.
 
-- **Option A (recommandée pour la phase 2)** : défaut `store`, comportement
-  identique à aujourd'hui, plus `--account play` pour l'usage en terminal.
-  Nexus affichera le gamertag et les succès du compte `store`, ce qui est
-  cohérent avec le compte qu'il montre.
-- **Option B** : par défaut, gamertag, succès et activité viennent de `play`
-  quand il est configuré, mais `account` garde le `username` `store` pour que
-  Nexus accepte la réponse. Un champ optionnel `playAccount` est ajouté. Le
-  format est inchangé, mais le sens de `account` change. C'est discutable pour
-  une PR upstream et fragile si Nexus évolue.
+- **Option A (recommended for phase 2)**: default `store`, behavior
+  identical to today, plus `--account play` for terminal use.
+  Nexus will display the gamertag and achievements of the `store` account,
+  which is consistent with the account it shows.
+- **Option B**: by default, gamertag, achievements and activity come from
+  `play` when it is configured, but `account` keeps the `store` `username` so
+  that Nexus accepts the response. An optional `playAccount` field is added.
+  The format is unchanged, but the meaning of `account` changes. This is
+  debatable for an upstream PR and fragile if Nexus evolves.
 
-**A2 — XStore : le reçu de licence porte l'identité `store`.**
-`store_license.rs` met le ticket MSA et le PUID du compte `store` dans
-`beneficiaries`. C'est le comportement Windows (le Store émet avec son compte),
-donc → `store`. Risque : un éditeur qui croise, côté serveur, le bénéficiaire du
-reçu avec l'XUID du joueur (`play`) peut refuser un DLC ou une monnaie. Il n'y a
-pas de correctif côté Xodus : Windows a le même comportement. On le documente
-dans le plan de test.
+**A2 — XStore: the license receipt carries the `store` identity.**
+`store_license.rs` puts the MSA ticket and the PUID of the `store` account in
+`beneficiaries`. This is the Windows behavior (the Store issues with its own
+account), so → `store`. Risk: a publisher that cross-checks, server-side, the
+receipt beneficiary against the player's XUID (`play`) may refuse a DLC or a
+currency. There is no fix on the Xodus side: Windows behaves the same way. It
+is documented in the test plan.
 
-**A3 — STS rafraîchi par `MsaTokenRequest`.** On résout le rôle effectif
-**une fois** (`play` s'il existe, sinon `store`) et on écrit dans ce rôle-là.
-En repli, c'est donc le STS `store` qui est rafraîchi, exactement comme
-aujourd'hui. Une session `play` ne peut jamais écrire dans `store`. Ce choix
-évite aussi une course si `play` est connecté pendant qu'une requête est en
-cours.
+**A3 — STS refreshed by `MsaTokenRequest`.** The effective role is resolved
+**once** (`play` if it exists, otherwise `store`) and that role is the one
+written to. In fallback, it is therefore the `store` STS that is refreshed,
+exactly as today. A `play` session can never write to `store`. This choice
+also avoids a race if `play` is signed in while a request is in
+flight.
 
-**A4 — PlayFab.** `XODUS_XSTS_PLAYFAB` est l'identité PlayFab du joueur → `play`,
-avec repli `store`.
+**A4 — PlayFab.** `XODUS_XSTS_PLAYFAB` is the player's PlayFab identity → `play`,
+with fallback `store`.
 
-**A5 — `logout` sans option.** Proposition : comportement **strictement
-identique** à aujourd'hui (utilisateur `store` + `device-tokens`, cache
-d'abonnement), et `play` est **conservé**. Raisons : Nexus appelle `logout`
-pour son propre compte. Une déconnexion Nexus qui effacerait aussi `play`
-surprendrait. `play` seul ne donne accès à rien sans `store`.
-`logout --account play` ne supprime que les clés `play/*`. Il ne touche ni à
-l'appareil, ni au cache d'abonnement. `--device` reste réservé à `store`.
+**A5 — `logout` without options.** Proposal: behavior **strictly
+identical** to today (`store` user + `device-tokens`, subscription
+cache), and `play` is **kept**. Reasons: Nexus calls `logout`
+for its own account. A Nexus sign-out that also cleared `play` would be
+surprising. `play` alone grants access to nothing without `store`.
+`logout --account play` removes only the `play/*` keys. It touches neither
+the device nor the subscription cache. `--device` remains reserved for `store`.
 
-**A6 — Changement de compte en cours de partie.** Le service relit le trousseau
-à chaque requête. Un `login --account play` pendant qu'un jeu tourne fera
-basculer les requêtes XUser suivantes. Il faut relancer le jeu après avoir
-configuré `play`.
+**A6 — Account switch mid-game.** The service re-reads the keyring
+on every request. A `login --account play` while a game is running will
+switch the subsequent XUser requests. The game must be restarted after
+configuring `play`.
 
-**A7 — Sauvegardes locales.** Le runtime range les sauvegardes locales sous
-`XodusGameSave\<xuid>\<scid>`. Après le passage à `play`, les sauvegardes
-locales faites jusqu'ici avec l'XUID `store` ne seront plus vues. Elles restent
-dans le préfixe, et le jeu synchronise le cloud de `play`. C'est attendu, et
-c'est à noter pour le test.
+**A7 — Local saves.** The runtime stores local saves under
+`XodusGameSave\<xuid>\<scid>`. After switching to `play`, local saves
+made so far with the `store` XUID will no longer be seen. They remain
+in the prefix, and the game syncs the `play` cloud. This is expected, and
+should be noted for the test.
 
-**A8 — Bloquant pour la phase 4 telle que décrite.** Avec une source
-**externe**, Nexus met `linuxRunPatch: undefined` (`src/main/backend.ts:112`).
-`gameLaunchArguments` refuse alors de lancer un jeu (`src/main/game-launch.ts:16`,
-« Play requires the current managed Xodus backend »). Avec la source externe
-seule, on peut installer, mais **pas jouer**. Contournement sans modifier le
-code de Nexus : `readPointer()` ne valide que le JSON et `validate(binaryPath)`.
-On peut donc sauvegarder `current.json`, puis écrire un `current.json` qui
-pointe vers notre build avec `linuxRunPatch: "linux-run-v22"`. Ça touche les
-données de Nexus (`~/.config/xodus-nexus/xodus-backends/`, chemin vérifié sur
-cette machine), donc je le ferai seulement avec ton accord.
+**A8 — Blocker for phase 4 as described.** With an **external**
+source, Nexus sets `linuxRunPatch: undefined` (`src/main/backend.ts:112`).
+`gameLaunchArguments` then refuses to launch a game (`src/main/game-launch.ts:16`,
+"Play requires the current managed Xodus backend"). With the external source
+alone, you can install, but **not play**. Workaround without modifying
+Nexus code: `readPointer()` only validates the JSON and `validate(binaryPath)`.
+So `current.json` can be backed up, then a `current.json` can be written that
+points to our build with `linuxRunPatch: "linux-run-v22"`. This touches Nexus
+data (`~/.config/xodus-nexus/xodus-backends/`, path verified on
+this machine), so it would only be done with the owner's approval.
 
-**A9 — Trousseau partagé.** Nexus et la CLI en terminal utilisent le même
-service Secret Service (`Xodus Service`) sur le bus de session. À vérifier en
-phase 4 : si Nexus démarre son propre fournisseur de trousseau
-(`keyring-session-stop`, `--provider-pid`), le terminal doit voir le même. Il
-faut alors lancer `xodus-cli login --account play` pendant que Nexus tourne,
-ou après un `keyring-unlock`.
+**A9 — Shared keyring.** Nexus and the terminal CLI use the same
+Secret Service service (`Xodus Service`) on the session bus. To verify in
+phase 4: if Nexus starts its own keyring provider
+(`keyring-session-stop`, `--provider-pid`), the terminal must see the same one.
+In that case `xodus-cli login --account play` must be run while Nexus is running,
+or after a `keyring-unlock`.
 
-## Décisions (22.10.2026)
+## Decisions (22.10.2026)
 
-- **A1** : le backend garde `store` par défaut pour `profile`, `achievements` et
-  `game-activity`, afin que Nexus upstream fonctionne sans changement.
-  `--account play` (avec repli) est ajouté. C'est le **fork Nexus** qui
-  demandera `play` et liera l'affichage à `account --account play`, comme
-  l'app Xbox.
-- **A5** : `logout` sans option garde le comportement actuel et conserve
-  `play`. `logout --account play` ne supprime que `play/*`.
-- **A8** : on passe par le fork Nexus. Le patch est ajouté à son lock, et
-  « Rebuild » produit un backend managed avec `linuxRunPatch` correct. On ne
-  bricole pas `current.json`.
+- **A1**: the backend keeps `store` as the default for `profile`, `achievements` and
+  `game-activity`, so that upstream Nexus works without changes.
+  `--account play` (with fallback) is added. It is the **Nexus fork** that
+  will request `play` and bind the display to `account --account play`, like
+  the Xbox app.
+- **A5**: `logout` without options keeps the current behavior and keeps
+  `play`. `logout --account play` removes only `play/*`.
+- **A8**: go through the Nexus fork. The patch is added to its lock, and
+  "Rebuild" produces a managed backend with the correct `linuxRunPatch`. No
+  hacking of `current.json`.
 
-## Design implémenté (ancien titre : « Design proposé pour la phase 2 »)
+## Implemented design (former title: "Proposed design for phase 2")
 
-Commits sur `dual-account` : `tokens: …`, `service: …`, `cli: …`.
+Commits on `dual-account`: `tokens: …`, `service: …`, `cli: …`.
 
-**Modèle** (`xodus/src/tokens/manager.rs`)
+**Model** (`xodus/src/tokens/manager.rs`)
 
-- `pub enum AccountRole { Store (défaut), Play }`, exporté par `xodus::tokens`.
-- `TokenManager` porte un champ `role`. `new()` donne `Store`, donc **tous les
-  appelants existants sont inchangés**.
-  - `for_role(role)` renvoie le même stockage, limité à un rôle.
-  - `resolve(role)` renvoie `Play` si un compte `play` existe, sinon `Store`.
-    Pour `Store`, il renvoie toujours `Store`.
-  - `has_user()` indique si un compte est stocké pour le rôle.
-- Clés : celles de `store` sont inchangées. `play` utilise
-  `play/user-session`, `play/user-tokens` et `play/user-DA`. `dev_license` et
-  `device-tokens` sont partagés.
-- `remove_persistent()` en `Play` ne supprime que les clés `play/*`. Les device
-  tokens ne sont retirés que par une déconnexion `store`, comme aujourd'hui.
+- `pub enum AccountRole { Store (default), Play }`, exported by `xodus::tokens`.
+- `TokenManager` carries a `role` field. `new()` gives `Store`, so **all
+  existing callers are unchanged**.
+  - `for_role(role)` returns the same storage, restricted to one role.
+  - `resolve(role)` returns `Play` if a `play` account exists, otherwise `Store`.
+    For `Store`, it always returns `Store`.
+  - `has_user()` indicates whether an account is stored for the role.
+- Keys: the `store` keys are unchanged. `play` uses
+  `play/user-session`, `play/user-tokens` and `play/user-DA`. `dev_license` and
+  `device-tokens` are shared.
+- `remove_persistent()` in `Play` removes only the `play/*` keys. Device
+  tokens are removed only by a `store` sign-out, as today.
 
 **Service** (`xodus-service/src/connection/xml.rs`)
 
-- `message_role()` est une fonction pure et testée :
-  `MsaTokenRequest` → `Play` ; `StoreLicenseTokenRequest` et
+- `message_role()` is a pure, tested function:
+  `MsaTokenRequest` → `Play`; `StoreLicenseTokenRequest` and
   `StorePackageUpdatesRequest` → `Store`.
-- `parse_message` résout le rôle une fois par requête, puis loggue au niveau
-  `info` : `message`, `role` et `fallback`, sans identifiant ni token.
-- `MsaTokenRequest` lit le STS et réécrit le STS rafraîchi **dans le rôle
-  résolu**. En repli, c'est donc `store`, exactement comme avant.
+- `parse_message` resolves the role once per request, then logs at
+  `info` level: `message`, `role` and `fallback`, with no identifier or token.
+- `MsaTokenRequest` reads the STS and writes the refreshed STS back **to the
+  resolved role**. In fallback, that is therefore `store`, exactly as before.
 
 **CLI**
 
-| Commande | Défaut (inchangé) | `--account play` |
+| Command | Default (unchanged) | `--account play` |
 |---|---|---|
-| `login` | `store` ; le cache d'abonnement est vidé | connecte `play` uniquement, le cache d'abonnement est conservé |
-| `logout [--device]` | `store` + device tokens + cache ; `play` conservé | ne supprime que `play/*` ; refuse `--device` |
-| `account [--json]` | sortie strictement identique | `{"role":"play"\|"store","fallback":bool,"stored":bool,"username"?}` : le compte qu'un jeu utiliserait |
-| `profile` | inchangé | gamertag/gamerpic de `play` (repli `store`) ; l'abonnement vient toujours de `store` |
-| `achievements`, `game-activity` | inchangés | données de `play` (repli `store`) ; `account` dans la sortie = compte effectif |
-| `run` | — | XSTS PlayFab (`XODUS_XSTS_PLAYFAB`) via `play`, avec repli ; licence de contenu via `store` |
-| `library`, `streaming`, `download`, `license`, `extract` | `store` | pas d'option, toujours `store` |
+| `login` | `store`; the subscription cache is cleared | signs in `play` only, the subscription cache is kept |
+| `logout [--device]` | `store` + device tokens + cache; `play` kept | removes only `play/*`; rejects `--device` |
+| `account [--json]` | strictly identical output | `{"role":"play"\|"store","fallback":bool,"stored":bool,"username"?}`: the account a game would use |
+| `profile` | unchanged | gamertag/gamerpic from `play` (fallback `store`); the subscription always comes from `store` |
+| `achievements`, `game-activity` | unchanged | `play` data (fallback `store`); `account` in the output = effective account |
+| `run` | — | PlayFab XSTS (`XODUS_XSTS_PLAYFAB`) via `play`, with fallback; content license via `store` |
+| `library`, `streaming`, `download`, `license`, `extract` | `store` | no option, always `store` |
 
-`login --account play` passe par le même transport que `login` : la webview
-native, ou `--external-webview-stdio` piloté par Nexus. **Le binaire compilé
-comme Nexus (`--no-default-features`) n'a pas de webview native.** Depuis un
-terminal, `login` échoue donc avec « sign-in UI » non disponible. La connexion
-du compte `play` doit être faite par le fork Nexus. Autre possibilité : un
-build de diagnostic avec webview (`cargo build --release -p xodus-cli`, qui
-demande `webkit2gtk4.1-devel`, à installer avec sudo).
+`login --account play` goes through the same transport as `login`: the native
+webview, or `--external-webview-stdio` driven by Nexus. **The binary built
+like Nexus (`--no-default-features`) has no native webview.** From a
+terminal, `login` therefore fails with "sign-in UI" unavailable. Signing in
+the `play` account must be done through the Nexus fork. Alternative: a
+diagnostic build with webview (`cargo build --release -p xodus-cli`, which
+requires `webkit2gtk4.1-devel`, to be installed with sudo).
 
-**Tests** (`xodus/src/tokens/dual_account_tests.rs`, préfixe `credential_` pour
-être exécutés par `build-backend.mjs` ; `xml.rs` : `store_and_play_message_roles`)
+**Tests** (`xodus/src/tokens/dual_account_tests.rs`, `credential_` prefix so
+they are run by `build-backend.mjs`; `xml.rs`: `store_and_play_message_roles`)
 
-- les clés historiques sont conservées ; isolation des rôles ;
-- repli `play → store`, y compris sur les entrées `store` à l'ancien format ;
-- `logout play` garde `store` et l'appareil ; `logout store` garde `play` ;
-- un STS `play` rafraîchi ne touche pas `store` ; un rafraîchissement en
-  repli reste dans `store` et ne crée pas de compte `play`.
+- legacy keys are preserved; role isolation;
+- `play → store` fallback, including on `store` entries in the old format;
+- `logout play` keeps `store` and the device; `logout store` keeps `play`;
+- a refreshed `play` STS does not touch `store`; a refresh in
+  fallback stays in `store` and does not create a `play` account.
 
-**Activité Xbox (corrigé le 22.10.2026, hors double compte)** : la date de
-dernière partie restait indisponible et la fiche affichait « Some Xbox activity
-could not be retrieved ». Il y avait deux causes.
+**Xbox activity (fixed on 22.10.2026, unrelated to dual account)**: the
+last-played date remained unavailable and the game page showed "Some Xbox activity
+could not be retrieved". There were two causes.
 
-- **Requête titlehub mal formée.** Elle utilisait la décoration `detail`, qui
-  laisse `titleHistory` à `null`, et n'envoyait pas d'`Accept-Language`, ce
-  qui provoque un HTTP 400. La requête utilise maintenant la décoration
-  `titlehistory` et envoie la langue.
-- **Statistique sans valeur rejetée.** userstats omet la valeur de
-  `MinutesPlayed` pour un jeu sans temps enregistré. Le parseur traitait ce
-  cas comme une erreur ; c'est maintenant « pas de donnée ».
+- **Malformed titlehub request.** It used the `detail` decoration, which
+  leaves `titleHistory` as `null`, and did not send an `Accept-Language`, which
+  causes an HTTP 400. The request now uses the `titlehistory` decoration
+  and sends the language.
+- **Statistic without a value rejected.** userstats omits the `MinutesPlayed`
+  value for a game with no recorded time. The parser treated this
+  case as an error; it is now "no data".
 
-`NEXUS_ACTIVITY_DIAGNOSTIC_V1 <stats|title>-<étape> <statut HTTP>` (stderr)
-indique désormais quelle lecture échoue.
+`NEXUS_ACTIVITY_DIAGNOSTIC_V1 <stats|title>-<step> <HTTP status>` (stderr)
+now indicates which read fails.
 
-**Vérifications** (rustc 1.99.0)
+**Verification** (rustc 1.99.0)
 
-- La séquence complète de `cargo test` de `build-backend.mjs`, plus
-  `cargo test -p xodus` : tout passe.
-- `cargo clippy --all-targets` : 35 avertissements avant et après, à
-  l'identique. Aucun nouvel avertissement.
-- `rustfmt` : le code ajouté est formaté. Les fichiers patchés par Nexus ne
-  l'étaient déjà pas ; je ne les ai pas reformatés.
-- Build release : `--help` expose toujours tout ce que
-  `parseBackendHelp`/`validate()`/`build-backend.mjs` attendent, et
-  `--account` est présent sur les six commandes.
+- The full `cargo test` sequence from `build-backend.mjs`, plus
+  `cargo test -p xodus`: all pass.
+- `cargo clippy --all-targets`: 35 warnings before and after,
+  identical. No new warnings.
+- `rustfmt`: the added code is formatted. The files patched by Nexus were
+  already not formatted; they were not reformatted.
+- Release build: `--help` still exposes everything
+  `parseBackendHelp`/`validate()`/`build-backend.mjs` expect, and
+  `--account` is present on all six commands.
 
-## Patch pour Nexus
+## Patch for Nexus
 
-`scripts/dual-account-patch.sh` produit `xodus-dual-account.patch` à partir de
-`git diff nexus-base..dual-account -- crates`. Ce patch s'applique avec
-`git apply --check` puis `git apply` après les 38 patches du lock, et le
-résultat est identique à `dual-account`. Entrée à ajouter **en dernier** dans
-`patches` :
+`scripts/dual-account-patch.sh` produces `xodus-dual-account.patch` from
+`git diff nexus-base..dual-account -- crates`. This patch applies with
+`git apply --check` then `git apply` after the 38 patches of the lock, and the
+result is identical to `dual-account`. Entry to add **last** in
+`patches`:
 
 ```json
 { "file": "xodus-dual-account.patch", "sha256": "f67a556fba4eb5ca6bd0466bb878d4d1a3aabe0aef7b534232960e2cc3b363b6" }
 ```
 
-C'est fait dans le fork Nexus, avec `patchId` = `linux-run-v38-dual-account-N` (incrémenté à chaque nouveau patch).
-Le `patchId` identifie la recette. `compatibility` reste à
-`linux-run-v22`, puisque le contrat de lancement ne change pas. Avec ça,
-**Rebuild** construit un backend managed qui peut lancer les jeux.
+This is done in the Nexus fork, with `patchId` = `linux-run-v38-dual-account-N` (incremented with each new patch).
+The `patchId` identifies the recipe. `compatibility` stays at
+`linux-run-v22`, since the launch contract does not change. With this,
+**Rebuild** builds a managed backend that can launch games.
 
-Le fork Nexus désactive l'installation de backends précompilés (ils n'ont pas
-le patch). Il compile ce backend via **« Use dual-account backend »**, et
-**« Restore previous backend »** permet de revenir au backend précédent.
+The Nexus fork disables installing prebuilt backends (they do not have
+the patch). It builds this backend via **"Use dual-account backend"**, and
+**"Restore previous backend"** reverts to the previous backend.
 
-## Mise à jour quand Nexus change
+## Updating when Nexus changes
 
-1. `git -C xodus-nexus fetch upstream` et fusion dans le fork Nexus ; lire le
-   nouveau `assets/backend-source.lock.json`.
-2. Dans `xodus-backend` (arbre propre) : `scripts/nexus-base.sh ../xodus-nexus nexus-base-next`.
-   Le script s'arrête si un patch ne s'applique pas ou si un sha256 diffère.
-3. `git rebase --onto nexus-base-next nexus-base dual-account`, puis renommer
-   `nexus-base-next` en `nexus-base`. Les conflits se limitent aux fichiers
-   listés ci-dessus.
-4. Si le lock change de version de Rust : `rustup toolchain install <rust>`
-   puis `rustup override set <rust>`.
-5. Rejouer les tests (section Vérifications), puis
-   `scripts/dual-account-patch.sh` et reporter le nouveau sha256 dans le lock
-   du fork Nexus.
+1. `git -C xodus-nexus fetch upstream` and merge into the Nexus fork; read the
+   new `assets/backend-source.lock.json`.
+2. In `xodus-backend` (clean tree): `scripts/nexus-base.sh ../xodus-nexus nexus-base-next`.
+   The script stops if a patch does not apply or if a sha256 differs.
+3. `git rebase --onto nexus-base-next nexus-base dual-account`, then rename
+   `nexus-base-next` to `nexus-base`. Conflicts are limited to the files
+   listed above.
+4. If the lock changes the Rust version: `rustup toolchain install <rust>`
+   then `rustup override set <rust>`.
+5. Rerun the tests (Verification section), then
+   `scripts/dual-account-patch.sh` and carry the new sha256 over into the lock
+   of the Nexus fork.
 
-## Plan de test manuel (après intégration Nexus)
+## Manual test plan (after Nexus integration)
 
-1. Sans compte `play` : tout se comporte comme avant (`account --account play`
-   indique `"fallback": true`).
-2. Connecter `play` par le fork Nexus, puis relancer le jeu (voir A6).
-3. Jeu de référence du wiki Compatibility de Nexus (Deep Rock Galactic, Gears
-   of War: E-Day…) :
-   - installation via `store` ;
-   - lancement ;
-   - gamertag en jeu = `play` ;
-   - cloud saves et succès de `play`.
-4. Le journal du jeu dans Nexus doit contenir
-   `Xodus account for MsaTokenRequest: play`, ainsi que `…: store` pour
-   `StoreLicenseTokenRequest` et `StorePackageUpdatesRequest`. Nexus lance le
-   service avec `XODUS_LOG=error,xodus_service::connection::xml=info` et ne
-   garde que ces valeurs. Ne pas utiliser `scripts/send_msa_token_request.py` :
-   il affiche le token reçu.
-5. Symptômes possibles si un jeu croise le Store avec le joueur (A2) :
-   - DLC ou contenu payant non reconnu alors que `store` le possède ;
-   - échec de reçu ou de licence en cours de partie ;
-   - monnaie virtuelle absente.
+1. Without a `play` account: everything behaves as before (`account --account play`
+   reports `"fallback": true`).
+2. Sign in `play` through the Nexus fork, then restart the game (see A6).
+3. Reference game from the Nexus Compatibility wiki (Deep Rock Galactic, Gears
+   of War: E-Day…):
+   - installation via `store`;
+   - launch;
+   - in-game gamertag = `play`;
+   - cloud saves and achievements of `play`.
+4. The game log in Nexus must contain
+   `Xodus account for MsaTokenRequest: play`, as well as `…: store` for
+   `StoreLicenseTokenRequest` and `StorePackageUpdatesRequest`. Nexus starts the
+   service with `XODUS_LOG=error,xodus_service::connection::xml=info` and keeps
+   only these values. Do not use `scripts/send_msa_token_request.py`:
+   it prints the received token.
+5. Possible symptoms if a game cross-checks the Store against the player (A2):
+   - DLC or paid content not recognized even though `store` owns it;
+   - receipt or license failure mid-game;
+   - missing virtual currency.
 
-   Diagnostic : logs du service (`Store license token request failed`,
-   `hresult`), puis comparer avec `logout --account play` (retour en mode
-   compte unique). Si le problème disparaît, c'est une vérification croisée
-   côté éditeur, et Windows se comporterait pareil.
-6. Sauvegardes locales créées avant le passage à `play` : elles ne sont plus
-   visibles (A7). C'est attendu, et c'est la sauvegarde cloud de `play` qui
-   prend le relais.
+   Diagnosis: service logs (`Store license token request failed`,
+   `hresult`), then compare with `logout --account play` (back to
+   single-account mode). If the problem goes away, it is a publisher-side
+   cross-check, and Windows would behave the same way.
+6. Local saves created before switching to `play`: they are no longer
+   visible (A7). This is expected, and the `play` cloud save
+   takes over.
