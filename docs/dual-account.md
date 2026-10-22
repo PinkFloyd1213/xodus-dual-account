@@ -1,8 +1,9 @@
 # Deux comptes : `store` (licence) et `play` (identité en jeu)
 
-> **Statut : backend implémenté et testé (branche `dual-account`).** Reste :
-> intégration dans le fork Nexus (lock, connexion du compte `play`, affichage),
-> puis test manuel en jeu.
+> **Statut : backend et fork Nexus implémentés et testés** (branches
+> `dual-account` des deux forks). Reste le test manuel en jeu avec les vrais
+> comptes (plan en fin de document). Guide d'utilisation : `docs/DUAL_ACCOUNT.md`
+> du fork Nexus.
 >
 > Objectif : reproduire Windows. Le compte qui a le Game Pass (`store`) ne sert
 > qu'aux licences, en arrière-plan, comme le Microsoft Store. Tout ce que
@@ -282,18 +283,17 @@ résultat est identique à `dual-account`. Entrée à ajouter **en dernier** dan
 `patches` :
 
 ```json
-{ "file": "xodus-dual-account.patch", "sha256": "73d6c752c74ec5372cf8cdc61eb0c8e14958f03d13efa36d95cba5a9f27e5d0a" }
+{ "file": "xodus-dual-account.patch", "sha256": "7356975ce87256303bfdd38f5c8e77a75ca50626210b82157ecb3dfd992b8ce8" }
 ```
 
-Dans le fork Nexus, il faut aussi changer `patchId`, qui identifie la recette
-(par exemple `linux-run-v38-dual-account-1`). `compatibility` reste à
+C'est fait dans le fork Nexus, avec `patchId` = `linux-run-v38-dual-account-1`.
+Le `patchId` identifie la recette. `compatibility` reste à
 `linux-run-v22`, puisque le contrat de lancement ne change pas. Avec ça,
 **Rebuild** construit un backend managed qui peut lancer les jeux.
 
-Attention : **Update** (binaire précompilé publié par Nexus upstream)
-remplacerait ce backend par un backend sans double compte. Ce n'est pas
-destructif (les clés `play/*` sont simplement ignorées), mais le fork Nexus
-devra pointer ses releases vers le fork, ou désactiver Update.
+Le fork Nexus désactive l'installation de backends précompilés (ils n'ont pas
+le patch). Il compile ce backend via **« Use dual-account backend »**, et
+**« Restore previous backend »** permet de revenir au backend précédent.
 
 ## Mise à jour quand Nexus change
 
@@ -321,9 +321,11 @@ devra pointer ses releases vers le fork, ou désactiver Update.
    - lancement ;
    - gamertag en jeu = `play` ;
    - cloud saves et succès de `play`.
-4. Logs du service (`XODUS_LOG=xodus_service=info`) : `role="play"` sur
-   `MsaTokenRequest`, `role="store"` sur `StoreLicenseTokenRequest` et
-   `StorePackageUpdatesRequest`. Ne pas utiliser `scripts/send_msa_token_request.py` :
+4. Le journal du jeu dans Nexus doit contenir
+   `Xodus account for MsaTokenRequest: play`, ainsi que `…: store` pour
+   `StoreLicenseTokenRequest` et `StorePackageUpdatesRequest`. Nexus lance le
+   service avec `XODUS_LOG=error,xodus_service::connection::xml=info` et ne
+   garde que ces valeurs. Ne pas utiliser `scripts/send_msa_token_request.py` :
    il affiche le token reçu.
 5. Symptômes possibles si un jeu croise le Store avec le joueur (A2) :
    - DLC ou contenu payant non reconnu alors que `store` le possède ;
