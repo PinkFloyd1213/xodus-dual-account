@@ -15,7 +15,7 @@ use uuid::Uuid;
 use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
-use crate::package::{get_content_id, get_packages};
+use crate::package::get_packages;
 
 #[path = "streaming_progress.rs"]
 mod progress;
@@ -47,7 +47,12 @@ pub async fn run(
     market: Option<String>,
     progress_json: bool,
     control_stdin: bool,
+    selected_content_id: Option<String>,
 ) -> ExitCode {
+    if selected_content_id.is_some() && (Uuid::try_parse(&source).is_ok() || source.contains("://")) {
+        eprintln!("Package selection requires a Store product ID");
+        return ExitCode::FAILURE;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
     let pause = progress::controls(control_stdin, tx.clone());
     if source.starts_with("file://") {
@@ -87,7 +92,11 @@ pub async fn run(
             source
         } else {
             let content_id = if Uuid::try_parse(&source).is_err() {
-                let content_id_task = get_content_id(client, source, market.clone()).await;
+                let region = market.clone().unwrap_or("US".into()).to_uppercase();
+                let content_id_task = match crate::package_plan::resolve(client, &source.to_uppercase(), &region).await {
+                    Ok(plan) => plan.select(selected_content_id.as_deref()),
+                    Err(error) => Err(error),
+                };
                 let Ok(content_id) = content_id_task else {
                     let Err(err) = content_id_task else {
                         eprintln!("Unknown Error");
