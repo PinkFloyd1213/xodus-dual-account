@@ -18,6 +18,12 @@ mod webview;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[cfg(target_os = "linux")]
+    #[command(about = "Unlock the default system wallet without reading credentials or signing in")]
+    KeyringUnlock {
+        #[arg(long, default_value = "")]
+        window_id: String,
+    },
     #[command(about = "Resolve public Store packages without sign-in or downloading")]
     ResolvePackage {
         product: String,
@@ -213,6 +219,19 @@ async fn main() -> ExitCode {
         .build()
         .unwrap();
     let args = CliArgs::parse();
+    #[cfg(target_os = "linux")]
+    if let SubCommand::KeyringUnlock { window_id } = &args.command {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let state = if ctrlc::set_handler(move || { signal.store(true, Ordering::SeqCst); }).is_err() {
+            xodus::keyring_unlock::UnlockState::Unavailable
+        } else {
+            xodus::keyring_unlock::unlock_default(window_id, &cancelled)
+        };
+        println!("{}", serde_json::json!({"schema": 1, "state": state.as_str()}));
+        return ExitCode::SUCCESS;
+    }
     #[cfg(not(feature = "native-webview"))]
     if args.external_webview_stdio {
         webview::enable_stdio();
@@ -256,6 +275,8 @@ async fn main() -> ExitCode {
     }
 
     let code = match args.command {
+        #[cfg(target_os = "linux")]
+        SubCommand::KeyringUnlock { .. } => unreachable!(),
         SubCommand::ResolvePackage { .. } => unreachable!(),
         SubCommand::Download {
             product,
