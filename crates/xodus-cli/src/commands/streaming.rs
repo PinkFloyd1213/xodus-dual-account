@@ -9,7 +9,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use msixvc::streaming;
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncRead, AsyncSeekExt};
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
@@ -23,6 +23,10 @@ mod progress;
 mod resume;
 #[path = "streaming_failure.rs"]
 mod failure;
+
+#[cfg(test)]
+#[path = "streaming_preflight_tests.rs"]
+mod preflight_tests;
 
 struct Job {
     name: String,
@@ -128,15 +132,18 @@ pub async fn run(
                 eprintln!("No .msixvc file found");
                 return ExitCode::FAILURE;
             };
+            let Some(root) = file.cdn_root_paths.first() else {
+                eprintln!("Microsoft returned no package download location."); return ExitCode::FAILURE;
+            };
             format!(
                 "{}{}",
-                file.cdn_root_paths.first().unwrap(),
+                root,
                 file.relative_url
             )
         };
         let url = &vurl;
         let mut pos = 0;
-        let http_file = streaming::HttpRead::open(
+        let http_file = match streaming::HttpRead::open(
             client.clone(),
             url,
             Some(|c, _| {
@@ -151,8 +158,10 @@ pub async fn run(
                 }
             }),
         )
-        .await
-        .expect("ok");
+        .await {
+            Ok(file) => file,
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        };
         let l = http_file.len();
 
         return run_cli_reader(
@@ -284,7 +293,9 @@ where
 {
     let out: &Path = Path::new(&destination);
 
-    std::fs::create_dir_all(out).expect("ok");
+    if let Err(error) = std::fs::create_dir_all(out) {
+        failure::report(&error); return ExitCode::FAILURE;
+    }
     let _folder_lock = match resume::lock(out) {
         Ok(lock) => lock,
         Err(error) => {
@@ -296,10 +307,14 @@ where
     let cache_path = out.join(".xodus-streaming-tmp.msixvc");
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut remote_file = streaming::PrefixCacheFile::new(reader, l, cache_path.clone())
-        .await
-        .expect("no err");
-    let remote_xvd = XvdFile::parse(&mut remote_file).await.expect("no err");
+    let mut remote_file = match streaming::PrefixCacheFile::new(reader, l, cache_path.clone()).await {
+        Ok(file) => file,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let remote_xvd = match XvdFile::parse(&mut remote_file).await {
+        Ok(xvd) => xvd,
+        Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+    };
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -309,16 +324,18 @@ where
     {
         Ok(files) => files,
         Err(error) => {
-            eprintln!("Cannot read package-file metadata: {error}");
+            failure::report_metadata(error.as_ref());
             return ExitCode::FAILURE;
         }
     };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            let sfiles = remote_xvd
+            let sfiles = match remote_xvd
                 .parse_segment_metadata(&mut remote_file, v)
-                .await
-                .expect("ok");
+                .await {
+                Ok(files) => files,
+                Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+            };
             rfiles = sfiles;
         }
     }
@@ -329,10 +346,12 @@ where
         })
         .await
         .ok();
-        let sfiles = remote_xvd
+        let sfiles = match remote_xvd
             .parse_ntfs_segment_metadata(&mut remote_file, !rfiles.is_empty())
-            .await
-            .expect("ok");
+            .await {
+            Ok(files) => files,
+            Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+        };
         rfiles.extend(sfiles);
     }
 
@@ -343,18 +362,24 @@ where
         .ok();
 
     if let Some(mut file) = file {
-        let xvd = XvdFile::parse(&mut file).await.expect("no err");
+        let xvd = match XvdFile::parse(&mut file).await {
+            Ok(xvd) => xvd,
+            Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+        };
 
         let files = match xvd.parse_user_package_files(&mut file).await {
             Ok(files) => files,
             Err(error) => {
-                eprintln!("Cannot read cached package-file metadata: {error}");
+                failure::report_metadata(error.as_ref());
                 return ExitCode::FAILURE;
             }
         };
         for (k, v) in &files {
             if k == "SegmentMetadata.bin" {
-                let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
+                let sfiles = match xvd.parse_segment_metadata(&mut file, v).await {
+                    Ok(files) => files,
+                    Err(error) => { failure::report_metadata(error.as_ref()); return ExitCode::FAILURE; }
+                };
                 lfiles = sfiles;
             }
         }
@@ -390,7 +415,10 @@ where
         return ExitCode::FAILURE;
     };
 
-    let full_key = content_key.unpack(&key).expect("failed to unpack");
+    let full_key = match content_key.unpack(&key) {
+        Ok(key) => key,
+        Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
+    };
 
     let total_size: u64 = rfiles
         .iter()
@@ -505,11 +533,7 @@ where
             if url.starts_with("file://") && offset != job.content.length {
                 offset = 0;
             }
-            if offset != job.content.length {
-                fout.set_len(offset).await?;
-                fout.seek(std::io::SeekFrom::Start(offset))
-                    .await?;
-            }
+            resume::prepare_output(&mut fout, offset).await?;
             let mut lp = offset;
 
             let progress = |pos, _| {

@@ -11,6 +11,10 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 const UPSTREAM_READ_CHUNK_SIZE: usize = 64 * 1024;
 
+#[cfg(test)]
+#[path = "streaming_metadata_tests.rs"]
+mod metadata_tests;
+
 /// Stable digest used for package identity and durable download checkpoints.
 pub fn resume_digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -20,7 +24,7 @@ pub fn resume_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
 
 struct ActiveHttpStream {
@@ -56,8 +60,13 @@ impl<'t> HttpRead<'t> {
     where
         Progress: FnMut(u64, u64) + Send + 't,
     {
+        Self::open_with_policy(client, url, progress, crate::streaming_http::Policy::default()).await
+    }
+
+    async fn open_with_policy<Progress>(client: reqwest::Client, url: impl Into<String>, progress: Option<Progress>, policy: crate::streaming_http::Policy) -> std::io::Result<Self>
+    where Progress: FnMut(u64, u64) + Send + 't {
         let url = url.into();
-        let initial = open_http_stream(client.clone(), url.clone(), None).await?;
+        let initial = open_http_stream_with_policy(client.clone(), url.clone(), None, policy).await?;
 
         Ok(Self {
             client,
@@ -191,16 +200,13 @@ impl<'t> AsyncRead for HttpRead<'t> {
                     self.pending_chunk = Some(chunk);
                     self.pending_chunk_offset = 0;
                 }
-                Poll::Ready(Some(Err(_err))) => {
-                    self.active = None;
-                    continue;
-                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Err(err)),
                 Poll::Ready(None) => {
                     self.active = None;
                     if self.pos >= self.len {
                         return Poll::Ready(Ok(()));
                     }
-                    continue;
+                    return Poll::Ready(Err(Error::new(ErrorKind::UnexpectedEof, "Package metadata transfer ended early.")));
                 }
             }
         }
@@ -592,17 +598,45 @@ async fn open_http_stream(
     url: String,
     start: Option<u64>,
 ) -> std::io::Result<OpenedHttpStream> {
-    let mut request = client.get(url);
+    open_http_stream_with_policy(client, url, start, crate::streaming_http::Policy::default()).await
+}
+
+async fn open_http_stream_with_policy(
+    client: reqwest::Client, url: String, start: Option<u64>, policy: crate::streaming_http::Policy,
+) -> std::io::Result<OpenedHttpStream> {
+    use crate::streaming_http::{RangeReader, TransferError};
+    use reqwest::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+    let mut attempt = 0u32;
+    let started = tokio::time::Instant::now();
+    let response = loop {
+    let mut request = client.get(&url).header(ACCEPT_ENCODING, "identity");
     if let Some(start) = start {
         request = request.header(RANGE, format!("bytes={start}-"));
     }
 
-    let response = request
-        .send()
-        .await
-        .map_err(http_err)?
-        .error_for_status()
-        .map_err(http_err)?;
+    let remaining = policy.budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() { return Err(Error::other(TransferError::new("metadata-headers-timeout", 0))); }
+    let result = tokio::time::timeout(policy.timeout.min(remaining), request.send()).await;
+    let error = match result {
+        Ok(Ok(response)) if response.status().is_success() => break response,
+        Ok(Ok(response)) => {
+            let status = response.status().as_u16();
+            let error = TransferError::new("metadata-http", status);
+            if !matches!(status, 408 | 500 | 502 | 503 | 504) { return Err(Error::other(error)); }
+            error
+        }
+        Ok(Err(error)) => TransferError::new(if error.is_timeout() { "metadata-headers-timeout" } else { "metadata-request" }, 0),
+        Err(_) => TransferError::new("metadata-headers-timeout", 0),
+    };
+    if attempt >= policy.retries { return Err(Error::other(error)); }
+    let delay = policy.backoff.saturating_mul(1 << attempt.min(4));
+    if delay >= policy.budget.saturating_sub(started.elapsed()) { return Err(Error::other(error)); }
+    tokio::time::sleep(delay).await;
+    attempt += 1;
+    };
+    if response.headers().get(CONTENT_ENCODING).is_some_and(|value| value != "identity") {
+        return Err(Error::other(TransferError::new("metadata-encoding", response.status().as_u16())));
+    }
 
     let (actual_start, len) = match start {
         None => {
@@ -660,15 +694,15 @@ async fn open_http_stream(
         }
     };
 
+    let reader = RangeReader::from_response(&client, &url, actual_start, len, response, policy);
+    let stream = futures_util::stream::try_unfold(reader, |mut reader| async move {
+        reader.next().await.map(|bytes| bytes.map(|bytes| (bytes, reader))).map_err(Error::other)
+    });
     Ok(OpenedHttpStream {
         start: actual_start,
         len,
-        stream: crate::bandwidth::limit_body(response.bytes_stream()),
+        stream: Box::pin(stream),
     })
-}
-
-fn http_err(err: reqwest::Error) -> std::io::Error {
-    Error::other(err)
 }
 
 #[cfg(test)]
@@ -935,7 +969,7 @@ mod tests {
         let ranges = server.request_ranges();
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0], None);
-        assert_eq!(ranges[1].as_deref(), Some("bytes=96-"));
+        assert_eq!(ranges[1].as_deref(), Some("bytes=96-16383"));
         let _ = std::fs::remove_file(cache);
     }
 
@@ -947,7 +981,7 @@ mod tests {
 
         let mut buf = [0u8; 256];
         let err = file.read_exact(&mut buf).await.unwrap_err();
-        assert!(err.to_string().contains("range resume mismatch"));
+        assert!(err.to_string().contains("transfer-range"));
         let _ = std::fs::remove_file(cache);
     }
 }
