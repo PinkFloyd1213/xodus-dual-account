@@ -6,6 +6,7 @@ pub mod license;
 pub mod login;
 pub mod logout;
 pub mod profile;
+pub mod game_activity;
 pub mod subscription;
 pub mod library;
 #[cfg(unix)]

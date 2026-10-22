@@ -7,7 +7,7 @@ use xodus::{models::{live::ExchangeUserTokenOutcome, secrets::Token, soap}, toke
 const PROFILE: &str = "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag,PublicGamerpic";
 const MAX_IMAGE: usize = 2 * 1024 * 1024;
 
-async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, &'static str> {
+pub(super) async fn bounded(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, &'static str> {
     if !response.status().is_success() { return Err("http-status"); }
     if response.content_length().is_some_and(|size| size > limit as u64) { return Err("response-size"); }
     let mut bytes = Vec::new();
@@ -46,7 +46,7 @@ fn image_data(bytes: &[u8]) -> Option<String> {
     Some(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes)))
 }
 
-async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
+pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Client, String, String), &'static str> {
     let account = tokens.get_user().map_err(|_| "stored-account")?.username;
     let Token::Legacy(device) = tokens.get_device_sts_token().map_err(|_| "device-token")? else { return Err("device-token"); };
     let Token::Legacy(user) = tokens.get_user_sts_token().map_err(|_| "user-token")? else { return Err("user-token"); };
@@ -68,6 +68,11 @@ async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
     let xsts = xodus::api::xbox::request_xsts_token(&client, user.token, "http://xboxlive.com").await.map_err(|_| "xsts")?;
     let uhs = xsts.user_hash().ok_or("xsts-claim")?;
     let authorization = format!("XBL3.0 x={uhs};{}", xsts.token);
+    Ok((client, authorization, account))
+}
+
+async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
+    let (client, authorization, account) = xbox_session(tokens).await?;
     let response = client.get(PROFILE).header("Authorization", authorization)
         .header("x-xbl-contract-version", "2").send().await.map_err(|_| "profile-request")?;
     let body = bounded(response, 128 * 1024).await?;

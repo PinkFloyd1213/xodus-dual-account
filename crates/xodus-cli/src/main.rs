@@ -73,6 +73,12 @@ enum SubCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Read Xbox time played and last activity for one title without starting sign-in")]
+    GameActivity {
+        title_id: u32,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Read account product entitlements without starting sign-in")]
     Library {
         #[arg(long, default_value_t = false)]
@@ -227,6 +233,7 @@ async fn main() -> ExitCode {
         args.command,
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
+            | SubCommand::GameActivity { .. }
             | SubCommand::Library { .. }
             | SubCommand::Clep { .. }
             | SubCommand::SpLicense { .. }
@@ -290,6 +297,7 @@ async fn main() -> ExitCode {
             }
         },
         SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
+        SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
         SubCommand::Login => commands::login::run(&client, &tokens).await,
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
