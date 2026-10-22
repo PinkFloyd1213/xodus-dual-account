@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use xodus::models::live::{DAProperty, ExchangeUserTokenOutcome};
 use xodus::models::{secrets, soap};
-use xodus::tokens::TokenManager;
+use xodus::tokens::{AccountRole, TokenManager};
 
 use crate::webview;
 
@@ -11,7 +11,10 @@ const LOGIN_MARKET: &str = "en-US";
 const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
 
 pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
-    super::subscription::clear();
+    // The membership cache belongs to the store account only.
+    if tokens.role() == AccountRole::Store {
+        super::subscription::clear();
+    }
     let token = match tokens.get_device_sts_token() {
         Ok(token) => token,
         Err(error) => {
