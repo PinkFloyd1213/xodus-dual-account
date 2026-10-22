@@ -4,6 +4,7 @@ use xodus::models::secrets::Token;
 use xodus::models::soap;
 use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
 use xodus::proto::xodus::XodusMessageType;
+use xodus::tokens::AccountRole;
 
 use crate::XML_MAGIC;
 use crate::simple_context::SimpleContext;
@@ -33,11 +34,36 @@ pub async fn handle(
     socket.write_all(&data).await
 }
 
+/// Account each request is issued for: the game's own identity uses the play
+/// account (falling back to store), Store licensing and packages use store.
+pub fn message_role(message_type: XodusMessageType) -> Option<AccountRole> {
+    match message_type {
+        XodusMessageType::MsaTokenRequest => Some(AccountRole::Play),
+        XodusMessageType::StoreLicenseTokenRequest
+        | XodusMessageType::StorePackageUpdatesRequest => Some(AccountRole::Store),
+        _ => None,
+    }
+}
+
 pub async fn parse_message(
     context: &mut SimpleContext,
     message_type: XodusMessageType,
     buffer: Vec<u8>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let tokens = match message_role(message_type) {
+        Some(requested) => {
+            let tokens = context.tokens().resolve(requested)?;
+            // Role names only: never account identifiers or token material.
+            tracing::info!(
+                message = ?message_type,
+                role = tokens.role().as_str(),
+                fallback = tokens.role() != requested,
+                "Issuing credentials"
+            );
+            Some(tokens)
+        }
+        None => None,
+    };
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
         XodusMessageType::StorePackageUpdatesRequest => {
@@ -54,7 +80,8 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
-            let Token::Legacy(token) = context.tokens().get_user_sts_token()? else {
+            let tokens = tokens.ok_or(xodus::models::secrets::InvalidTokenResponse)?;
+            let Token::Legacy(token) = tokens.get_user_sts_token()? else {
                 return Ok(vec![]);
             };
             let scope = if req.msa_full_trust {
@@ -112,7 +139,8 @@ pub async fn parse_message(
                         } else {
                             address
                         };
-                        if let Err(err) = context.tokens().save_user_token(address, sts) {
+                        // Persist into the role that issued it, never another account.
+                        if let Err(err) = tokens.save_user_token(address, sts) {
                             tracing::warn!("Failed to persist refreshed STS token: {err}");
                         }
                     }
@@ -137,5 +165,27 @@ pub async fn parse_message(
             }
         }
         _ => Err("Unimplemented".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_and_play_message_roles() {
+        assert_eq!(
+            message_role(XodusMessageType::MsaTokenRequest),
+            Some(AccountRole::Play)
+        );
+        for message in [
+            XodusMessageType::StoreLicenseTokenRequest,
+            XodusMessageType::StorePackageUpdatesRequest,
+        ] {
+            assert_eq!(message_role(message), Some(AccountRole::Store));
+        }
+        for message in [XodusMessageType::Ping, XodusMessageType::Unknown] {
+            assert_eq!(message_role(message), None);
+        }
     }
 }
