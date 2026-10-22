@@ -66,6 +66,7 @@ pub(crate) struct RangeReader<'a> {
     response_end: u64,
     total: Option<u64>,
     body: Option<Body>,
+    pending: Bytes,
     policy: Policy,
     failures: u32,
     last_progress: Instant,
@@ -86,6 +87,7 @@ impl<'a> RangeReader<'a> {
             response_end: end,
             total: None,
             body: None,
+            pending: Bytes::new(),
             policy,
             failures: 0,
             last_progress: Instant::now(),
@@ -93,6 +95,7 @@ impl<'a> RangeReader<'a> {
     }
     pub fn disconnect(&mut self) {
         self.body = None;
+        self.pending = Bytes::new();
         self.failures = 0;
         self.last_progress = Instant::now();
     }
@@ -122,6 +125,18 @@ impl<'a> RangeReader<'a> {
         loop {
             if self.position > self.end {
                 return Ok(None);
+            }
+            if !self.pending.is_empty() {
+                let len=self.pending.len().min(16*1024);
+                // Intentional throttling is outside the network timeout and
+                // survives control cancellation without losing buffered bytes.
+                crate::bandwidth::acquire(len).await;
+                let bytes=self.pending.split_to(len);
+                self.position+=len as u64;
+                self.failures=0;
+                self.last_progress=Instant::now();
+                if self.position>self.response_end {self.body=None;}
+                return Ok(Some(bytes));
             }
             let limit = self.policy.timeout.min(self.remaining());
             if limit.is_zero() {
@@ -186,13 +201,7 @@ impl<'a> RangeReader<'a> {
                     if bytes.len() as u64 > self.response_end - self.position + 1 {
                         return Err(TransferError::new("transfer-size", 206));
                     }
-                    self.position += bytes.len() as u64;
-                    self.failures = 0;
-                    self.last_progress = Instant::now();
-                    if self.position > self.response_end {
-                        self.body = None;
-                    }
-                    return Ok(Some(bytes));
+                    self.pending=bytes;
                 }
                 Ok(Some(Ok(_))) => {
                     self.retry(TransferError::new("transfer-eof", 0)).await?;
