@@ -71,12 +71,13 @@ async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Re
         .await.map_err(|_| FAIL)?;
     let response = match user_response {
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) =>
-            collection.security_tokens.into_iter().find(|r| r.token_type == "urn:passport:compact").ok_or(FAIL)?,
+            collection.security_tokens.into_iter().find(|r| user_ticket_type(&r.token_type)).ok_or(FAIL)?,
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => *response,
         _ => return Err(DENIED),
     };
-    if response.token_type != "urn:passport:compact" { return Err(FAIL) }
+    if !user_ticket_type(&response.token_type) { return Err(FAIL) }
     let Token::Compact(user_token) = Token::try_from(response).map_err(|_| FAIL)? else { return Err(FAIL) };
+    let user_token = xodus::models::secrets::store_ticket(user_token);
     let mut response = context.client.post("https://licensing.mp.microsoft.com/v8.0/licenseToken")
         .timeout(Duration::from_secs(60)).header("from", "XboxLicenseManager")
         .header("Authorization", device_token).header("User-Agent", "XboxGameRuntime")
@@ -97,9 +98,22 @@ async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Re
     Ok(response.license_token)
 }
 
+fn user_ticket_type(token_type: &str) -> bool {
+    matches!(token_type, "urn:passport:compact" | "urn:passport:delegationcompact")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_license_accepts_delegation_compact_user_tickets() {
+        assert!(user_ticket_type("urn:passport:compact"));
+        assert!(user_ticket_type("urn:passport:delegationcompact"));
+        assert!(!user_ticket_type("urn:passport:legacy"));
+        assert_eq!(xodus::models::secrets::store_ticket("d=abc".into()), "t=abc");
+        assert_eq!(xodus::models::secrets::store_ticket("t=abc&p=".into()), "t=abc&p=");
+    }
 
     fn request(ids: &[&str]) -> StoreLicenseTokenRequest {
         StoreLicenseTokenRequest { parent_product_id: "9N4PT8HGCDHQ".into(),

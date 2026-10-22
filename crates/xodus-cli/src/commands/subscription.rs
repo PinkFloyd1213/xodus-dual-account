@@ -147,10 +147,15 @@ pub(super) async fn store_session(
     let Token::Compact(ticket) = token else {
         return Err("store-ticket-type");
     };
-    if !ticket.starts_with("t=") || !ticket.contains("&p=") {
-        return Err("store-ticket-format");
-    }
+    let ticket = valid_store_ticket(ticket).ok_or("store-ticket-format")?;
     Ok((client, ticket))
+}
+
+/// Delegation-compact tickets have no "&p=" part and arrive as "d=..."; both
+/// ticket kinds work for the Store once sent as "t=...".
+fn valid_store_ticket(ticket: String) -> Option<String> {
+    let ticket = xodus::models::secrets::store_ticket(ticket);
+    (ticket.len() > 2 && ticket.starts_with("t=") && !ticket.contains(char::is_whitespace)).then_some(ticket)
 }
 
 async fn query(tokens: &TokenManager, account: &str) -> Result<(Value, i64), &'static str> {
@@ -221,6 +226,14 @@ mod tests {
     const NOW: i64 = 1_800_000_000;
     fn active() -> Value {
         json!({"entitlements":{"CFQ7TTC0KGQ8":{"status":"Active","endDate":chrono::DateTime::from_timestamp(NOW+3600,0).unwrap().to_rfc3339(),"autoRenew":true}}})
+    }
+    #[test]
+    fn store_ticket_accepts_compact_and_delegation_compact_forms() {
+        assert_eq!(valid_store_ticket("t=abc&p=".into()).as_deref(), Some("t=abc&p="));
+        assert_eq!(valid_store_ticket("d=abc".into()).as_deref(), Some("t=abc"));
+        for bad in ["", "t=", "d=", "abc", "t=a b", "x=abc"] {
+            assert_eq!(valid_store_ticket(bad.into()), None, "{bad}");
+        }
     }
     #[test]
     fn real_membership_shape_gives_pc_plan() {

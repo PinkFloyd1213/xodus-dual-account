@@ -81,6 +81,7 @@ pub async fn get_license(
     let Token::Compact(user_token) = user_token else {
         return Err("Unsupported token".to_string());
     };
+    let user_token = xodus::models::secrets::store_ticket(user_token);
 
     let (_content, game_license) = xodus::licensing::content::get_license_content(
         client,
