@@ -114,3 +114,106 @@ fn keyring_unlock_private_bus_ignores_completion_from_another_owner() {
     assert_eq!(state, UnlockState::TimedOut);
     assert!(calls.contains(&"Dismiss".into()));
 }
+
+fn create_probe(mode: &'static str) -> (UnlockState, Vec<String>) {
+    let bus = Bus::new();
+    let client = Connection::new_address(&bus.address).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(mode == "pre-cancelled"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let addr = bus.address.clone();
+    let (record, done, cancel) = (calls.clone(), stop.clone(), cancelled.clone());
+    let server = thread::spawn(move || {
+        let c = Connection::new_address(&addr).unwrap();
+        let intruder = Connection::new_address(&addr).unwrap();
+        if mode != "stopped" { c.request_name("org.freedesktop.secrets", false, true, false).unwrap(); }
+        let mut exists = matches!(mode, "existing-ready" | "existing-locked");
+        let mut locked = mode == "existing-locked";
+        let mut alias_reads = 0;
+        let mut sender = String::new();
+        c.start_receive(MatchRule::new_method_call(), Box::new(move |msg, c| {
+            let method = msg.member().unwrap().to_string();
+            record.lock().unwrap().push(method.clone());
+            let path = || Path::from("/org/freedesktop/secrets/collection/test");
+            let reply = match method.as_str() {
+                "ReadAlias" => {
+                    assert_eq!(msg.read1::<String>().unwrap(), "default");
+                    alias_reads += 1;
+                    if mode == "race" && alias_reads == 2 { exists = true; }
+                    msg.method_return().append1(if exists { path() } else { Path::from("/") })
+                },
+                "Get" => {
+                    let (interface, property) = msg.read2::<String,String>().unwrap();
+                    if interface == "org.freedesktop.Secret.Service" && property == "Collections" {
+                        let paths = if exists || mode == "other-collection" { vec![path()] } else { vec![] };
+                        msg.method_return().append1(Variant(paths))
+                    } else {
+                        assert_eq!((interface.as_str(), property.as_str()), ("org.freedesktop.Secret.Collection", "Locked"));
+                        msg.method_return().append1(Variant(locked))
+                    }
+                },
+                "CreateCollection" => {
+                    let (props, alias): (dbus::arg::PropMap,String) = msg.read2().unwrap();
+                    assert_eq!(alias, "default"); assert_eq!(props.len(), 1);
+                    assert_eq!(props["org.freedesktop.Secret.Collection.Label"].0.as_str(), Some("kdewallet"));
+                    sender = msg.sender().unwrap().to_string();
+                    if mode == "immediate" { exists = true; }
+                    msg.method_return().append2(if exists { path() } else { Path::from("/") },
+                        Path::from(if mode == "immediate" { "/" } else { "/org/freedesktop/secrets/prompt/create" }))
+                },
+                "Prompt" => {
+                    assert_eq!(msg.sender().unwrap().to_string(), sender);
+                    assert_eq!(msg.read1::<String>().unwrap(), "12345");
+                    c.send(msg.method_return()).unwrap();
+                    if mode == "cancel" { cancel.store(true, Ordering::SeqCst); }
+                    if matches!(mode, "complete" | "created-locked") { exists = true; }
+                    if mode == "created-locked" { locked = true; }
+                    if !matches!(mode, "cancel" | "timeout") {
+                        let signal = dbus::Message::new_signal("/org/freedesktop/secrets/prompt/create", "org.freedesktop.Secret.Prompt", "Completed").unwrap()
+                            .append2(mode == "dismissed", Variant(path()));
+                        if mode == "spoof" { intruder.send(signal).unwrap(); } else { c.send(signal).unwrap(); }
+                    }
+                    return true;
+                },
+                "Dismiss" => msg.method_return(),
+                _ => panic!("Unexpected method {method}: creation never accesses credentials or unlocks existing wallets"),
+            };
+            c.send(reply).unwrap(); true
+        }));
+        tx.send(()).unwrap();
+        while !done.load(Ordering::SeqCst) { c.process(Duration::from_millis(10)).unwrap(); }
+    });
+    rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let state = prepare_scoped(&client, "12345", &cancelled, Duration::from_millis(150), false, true);
+    stop.store(true, Ordering::SeqCst); server.join().unwrap();
+    let calls = calls.lock().unwrap().clone();
+    (state.unwrap(), calls)
+}
+
+#[test]
+fn keyring_create_never_replaces_existing_collections_or_creates_from_unlock() {
+    for (mode, expected) in [("stopped", UnlockState::Stopped), ("existing-ready", UnlockState::Ready),
+        ("existing-locked", UnlockState::Locked), ("other-collection", UnlockState::NeedsSetup),
+        ("race", UnlockState::NeedsSetup), ("pre-cancelled", UnlockState::Cancelled)] {
+        let (state, calls) = create_probe(mode); assert_eq!(state, expected, "{mode}");
+        assert!(!calls.iter().any(|v| matches!(v.as_str(), "CreateCollection" | "Unlock" | "Prompt")), "{mode}");
+    }
+    assert_eq!(probe("no-default").0, UnlockState::NeedsSetup);
+}
+#[test]
+fn keyring_create_native_prompt_rechecks_default_and_lock_state() {
+    for (mode, expected) in [("immediate", UnlockState::Ready), ("complete", UnlockState::Ready),
+        ("false-success", UnlockState::Locked), ("created-locked", UnlockState::Locked), ("dismissed", UnlockState::Cancelled)] {
+        let (state, calls) = create_probe(mode); assert_eq!(state, expected, "{mode}");
+        assert_eq!(calls.iter().filter(|v| v.as_bytes()==b"CreateCollection").count(), 1);
+        assert!(!calls.iter().any(|v| v=="Unlock"));
+    }
+}
+#[test]
+fn keyring_create_cancel_timeout_and_foreign_completion_are_bounded() {
+    for (mode, expected) in [("cancel", UnlockState::Cancelled), ("timeout", UnlockState::TimedOut), ("spoof", UnlockState::TimedOut)] {
+        let (state, calls) = create_probe(mode); assert_eq!(state, expected, "{mode}");
+        assert!(calls.iter().any(|v| v=="Dismiss"));
+    }
+}

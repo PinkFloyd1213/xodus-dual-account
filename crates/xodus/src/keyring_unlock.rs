@@ -19,17 +19,30 @@ fn valid_window_id(value: &str) -> bool {
 }
 
 pub fn unlock_default(window_id: &str, cancelled: &AtomicBool) -> UnlockState {
+    prepare_default(window_id, cancelled, false)
+}
+
+/// Explicit first-collection setup. The provider, never Nexus, handles passwords.
+pub fn create_default(window_id: &str, cancelled: &AtomicBool) -> UnlockState {
+    prepare_default(window_id, cancelled, true)
+}
+
+fn prepare_default(window_id: &str, cancelled: &AtomicBool, create: bool) -> UnlockState {
     if !valid_window_id(window_id) { return UnlockState::Unavailable; }
     let Ok(connection) = Connection::new_session() else { return UnlockState::Unavailable; };
     let gamescope = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').any(|v| v.eq_ignore_ascii_case("gamescope"));
-    unlock_scoped(&connection, window_id, cancelled, Duration::from_secs(90), gamescope).unwrap_or(UnlockState::Unavailable)
+    prepare_scoped(&connection, window_id, cancelled, Duration::from_secs(90), gamescope, create).unwrap_or(UnlockState::Unavailable)
 }
 
 #[cfg(test)]
 fn unlock_on(connection: &Connection, window_id: &str, cancelled: &AtomicBool, timeout: Duration) -> Result<UnlockState, dbus::Error> {
     unlock_scoped(connection, window_id, cancelled, timeout, false)
 }
+#[cfg(test)]
 fn unlock_scoped(connection: &Connection, window_id: &str, cancelled: &AtomicBool, timeout: Duration, gamescope: bool) -> Result<UnlockState, dbus::Error> {
+    prepare_scoped(connection, window_id, cancelled, timeout, gamescope, false)
+}
+fn prepare_scoped(connection: &Connection, window_id: &str, cancelled: &AtomicBool, timeout: Duration, gamescope: bool, create: bool) -> Result<UnlockState, dbus::Error> {
     let bus = connection.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(3));
     let (owned,): (bool,) = bus.method_call("org.freedesktop.DBus", "NameHasOwner", ("org.freedesktop.secrets",))?;
     if !owned { return Ok(UnlockState::Stopped); }
@@ -38,18 +51,50 @@ fn unlock_scoped(connection: &Connection, window_id: &str, cancelled: &AtomicBoo
     let (owner,): (String,) = bus.method_call("org.freedesktop.DBus", "GetNameOwner", ("org.freedesktop.secrets",))?;
     let service = connection.with_proxy(owner.clone(), "/org/freedesktop/secrets", Duration::from_secs(3));
     let (collection,): (Path<'static>,) = service.method_call("org.freedesktop.Secret.Service", "ReadAlias", ("default",))?;
-    if collection.to_string() == "/" { return Ok(UnlockState::NeedsSetup); }
+    let missing = collection.to_string() == "/";
+    if missing && !create { return Ok(UnlockState::NeedsSetup); }
+    if create && missing {
+        let collections: Vec<Path<'static>> = service.get("org.freedesktop.Secret.Service", "Collections")?;
+        // No default does not imply an empty keyring. Never choose/replace one
+        // of the user's existing collections or enable a disabled provider.
+        if !collections.is_empty() { return Ok(UnlockState::NeedsSetup); }
+    }
     let locked = || -> Result<bool, dbus::Error> {
-        connection.with_proxy(owner.clone(), collection.clone(), Duration::from_secs(3))
+        let (current_owner,): (String,) = bus.method_call("org.freedesktop.DBus", "GetNameOwner", ("org.freedesktop.secrets",))?;
+        if current_owner != owner { return Err(dbus::Error::new_failed("Wallet provider changed")); }
+        let target = if create {
+            let (alias,): (Path<'static>,) = service.method_call("org.freedesktop.Secret.Service", "ReadAlias", ("default",))?;
+            if alias.to_string() == "/" { return Ok(true); }
+            alias
+        } else { collection.clone() };
+        connection.with_proxy(owner.clone(), target, Duration::from_secs(3))
             .get("org.freedesktop.Secret.Collection", "Locked")
     };
-    if !locked()? { return Ok(UnlockState::Ready); }
+    if !missing {
+        let state = if locked()? { UnlockState::Locked } else { UnlockState::Ready };
+        if create || state == UnlockState::Ready { return Ok(state); }
+    }
     if cancelled.load(Ordering::SeqCst) { return Ok(UnlockState::Cancelled); }
     let (pid,): (u32,) = bus.method_call("org.freedesktop.DBus", "GetConnectionUnixProcessID", (owner.clone(),))?;
     let mut windows = window_id.parse().ok().and_then(|parent| prompt_window::PromptWindows::new(parent, pid, gamescope));
     if gamescope && windows.is_none() { return Ok(UnlockState::Unavailable); }
-    let (_unlocked, prompt): (Vec<Path<'static>>, Path<'static>) = service.method_call(
-        "org.freedesktop.Secret.Service", "Unlock", (vec![collection.clone()],))?;
+    let prompt = if create {
+        // Recheck immediately before mutation, after display-parent validation.
+        let (latest,): (Path<'static>,) = service.method_call("org.freedesktop.Secret.Service", "ReadAlias", ("default",))?;
+        let collections: Vec<Path<'static>> = service.get("org.freedesktop.Secret.Service", "Collections")?;
+        if latest.to_string() != "/" || !collections.is_empty() { return Ok(UnlockState::NeedsSetup); }
+        let (current_owner,): (String,) = bus.method_call("org.freedesktop.DBus", "GetNameOwner", ("org.freedesktop.secrets",))?;
+        if current_owner != owner { return Ok(UnlockState::Unavailable); }
+        let mut properties: std::collections::HashMap<String, Variant<Box<dyn RefArg>>> = std::collections::HashMap::new();
+        properties.insert("org.freedesktop.Secret.Collection.Label".into(), Variant(Box::new("kdewallet".to_string())));
+        let (_collection, prompt): (Path<'static>, Path<'static>) = service.method_call(
+            "org.freedesktop.Secret.Service", "CreateCollection", (properties, "default"))?;
+        prompt
+    } else {
+        let (_unlocked, prompt): (Vec<Path<'static>>, Path<'static>) = service.method_call(
+            "org.freedesktop.Secret.Service", "Unlock", (vec![collection.clone()],))?;
+        prompt
+    };
     if prompt.to_string() == "/" { return Ok(if locked()? { UnlockState::Locked } else { UnlockState::Ready }); }
     let complete = Arc::new(Mutex::new(None));
     let output = complete.clone();
@@ -60,7 +105,7 @@ fn unlock_scoped(connection: &Connection, window_id: &str, cancelled: &AtomicBoo
         true
     })?;
     let proxy = connection.with_proxy(owner.clone(), prompt, Duration::from_secs(3));
-    // A prompt is connection-specific. Keep this connection alive from Unlock
+    // A prompt is connection-specific. Keep this connection alive from the request
     // through Completed; separate busctl invocations cannot implement this.
     let result = (|| {
         let _: () = proxy.method_call("org.freedesktop.Secret.Prompt", "Prompt", (window_id,))?;
