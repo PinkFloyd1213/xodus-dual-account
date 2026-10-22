@@ -12,6 +12,13 @@ mod keys {
     pub const DEVICE_TOKENS: &str = "device-tokens";
     pub const USER_TOKENS: &str = "user-tokens";
     pub const USER_INFO: &str = "user-DA";
+    pub const USER_SESSION: &str = "user-session";
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UserSession {
+    user: User,
+    tokens: HashMap<String, Token>,
 }
 
 pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
@@ -58,7 +65,10 @@ impl TokenManager {
     pub fn remove_persistent(&self) -> Result<(), TokenStoreError> {
         self.persistent.remove(keys::DEVICE_TOKENS)?;
         self.persistent.remove(keys::USER_TOKENS)?;
-        self.persistent.remove(keys::USER_INFO)
+        self.persistent.remove(keys::USER_INFO)?;
+        // Clear legacy entries first so a failed logout never exposes a stale
+        // account underneath a still-valid session.
+        self.persistent.remove(keys::USER_SESSION)
     }
 
     // ---- Device identity / license -----------------------------------------
@@ -101,10 +111,21 @@ impl TokenManager {
     // ---- User STS tokens (keyed by SOAP "applies_to" address) --------------
 
     pub fn get_user_token_for(&self, address: &str) -> Result<Option<Token>, TokenStoreError> {
+        if let Some(session) = self.user_session()? {
+            return Ok(session.tokens.get(address).cloned());
+        }
         Self::read_token_store(&*self.persistent, keys::USER_TOKENS, address)
     }
 
     pub fn save_user_token(&self, address: String, token: Token) -> Result<(), TokenStoreError> {
+        if let Some(mut session) = self.user_session()? {
+            session.tokens.insert(address, token);
+            return Self::write_verified(
+                &*self.persistent,
+                keys::USER_SESSION,
+                &serde_json::to_vec(&session)?,
+            );
+        }
         Self::write_token_store(&*self.persistent, keys::USER_TOKENS, address, token)
     }
 
@@ -116,6 +137,9 @@ impl TokenManager {
     // ---- User info -----------------------------------------------------------
 
     pub fn get_user(&self) -> Result<User, TokenStoreError> {
+        if let Some(session) = self.user_session()? {
+            return Ok(session.user);
+        }
         let bytes = self
             .persistent
             .get(keys::USER_INFO)?
@@ -128,6 +152,32 @@ impl TokenManager {
             &*self.persistent,
             keys::USER_INFO,
             &serde_json::to_vec(user)?,
+        )
+    }
+
+    fn user_session(&self) -> Result<Option<UserSession>, TokenStoreError> {
+        self.persistent
+            .get(keys::USER_SESSION)?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Publish a newly authenticated account and its complete token set using
+    /// one keyring value. Never merge tokens belonging to the previous account.
+    /// Legacy entries remain readable until the first successful session save.
+    pub fn save_user_session(
+        &self,
+        user: User,
+        tokens: HashMap<String, Token>,
+    ) -> Result<(), TokenStoreError> {
+        if tokens.is_empty() || user.username.trim().is_empty() || user.puid.is_empty() {
+            return Err(TokenStoreError::NotFound);
+        }
+        let session = UserSession { user, tokens };
+        Self::write_verified(
+            &*self.persistent,
+            keys::USER_SESSION,
+            &serde_json::to_vec(&session)?,
         )
     }
 

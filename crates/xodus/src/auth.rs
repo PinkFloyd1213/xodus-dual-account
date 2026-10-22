@@ -103,7 +103,7 @@ pub async fn do_sisu(
         )
         .await?;
 
-    let Token::Compact(ms_device_token) = device_token_resp.into() else {
+    let Token::Compact(ms_device_token) = Token::try_from(device_token_resp)? else {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "error",
@@ -140,7 +140,7 @@ pub async fn do_sisu(
 
     if let Some(sts) = collection.security_tokens.pop() {
         let address = sts.applies_to.endpoint_reference.address.clone();
-        let sts: Token = sts.into();
+        let sts: Token = sts.try_into()?;
         let address = if let Token::Legacy(legacy) = &sts {
             legacy.key_name.clone().unwrap_or(address)
         } else {
@@ -150,8 +150,8 @@ pub async fn do_sisu(
             tracing::warn!("Failed to persist refreshed STS token: {err}");
         }
     }
-    let token: soap::RequestSecurityTokenResponse = collection.security_tokens.remove(0);
-    let token: Token = token.into();
+    let token = collection.security_tokens.into_iter().next().ok_or(crate::models::secrets::InvalidTokenResponse)?;
+    let token: Token = token.try_into()?;
     let Token::Compact(user_token) = token else {
         return Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,

@@ -138,10 +138,10 @@ pub(super) async fn store_session(
     let token: Token = match outcome {
         ExchangeUserTokenOutcome::Issued(
             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
-        ) if collection.security_tokens.len() == 1 => collection.security_tokens.remove(0).into(),
+        ) if collection.security_tokens.len() == 1 => Token::try_from(collection.security_tokens.remove(0)).map_err(|_| "ticket-response-parse")?,
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
             token,
-        )) => (*token).into(),
+        )) => Token::try_from(*token).map_err(|_| "ticket-response-parse")?,
         _ => return Err("store-ticket-refused"),
     };
     let Token::Compact(ticket) = token else {

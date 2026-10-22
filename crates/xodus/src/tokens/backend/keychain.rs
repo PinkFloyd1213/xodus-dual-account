@@ -17,6 +17,9 @@ impl TokenBackend for KeychainBackend {
     }
 
     fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
-        Ok(crate::secrets::get_entry(key)?.delete_credential()?)
+        match crate::secrets::get_entry(key)?.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }

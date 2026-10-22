@@ -62,7 +62,7 @@ pub async fn parse_message(
             } else {
                 "xboxlive.signin"
             };
-            let device_token = context.device_token.as_ref().unwrap();
+            let device_token = context.device_token.as_ref().ok_or(xodus::models::secrets::InvalidTokenResponse)?;
             let device_token_resp = xodus::api::live::exchange_device_token(
                 &context.client,
                 device_token.clone(),
@@ -72,10 +72,10 @@ pub async fn parse_message(
             )
             .await;
 
-            let ms_device_rps_token = if let Some((Token::Compact(ms_device_token), Ok(lifetime))) =
+            let ms_device_rps_token = if let Some((Ok(Token::Compact(ms_device_token)), Ok(lifetime))) =
                 device_token_resp.ok().map(|t| {
                     let expiry = chrono::DateTime::parse_from_rfc3339(&t.lifetime.expires);
-                    (t.into(), expiry)
+                    (Token::try_from(t), expiry)
                 }) {
                 Some((ms_device_token, lifetime.timestamp()))
             } else {
@@ -106,7 +106,7 @@ pub async fn parse_message(
                 ) => {
                     if let Some(sts) = collection.security_tokens.pop() {
                         let address = sts.applies_to.endpoint_reference.address.clone();
-                        let sts: Token = sts.into();
+                        let sts: Token = sts.try_into()?;
                         let address = if let Token::Legacy(legacy) = &sts {
                             legacy.key_name.clone().unwrap_or(address)
                         } else {
@@ -116,9 +116,9 @@ pub async fn parse_message(
                             tracing::warn!("Failed to persist refreshed STS token: {err}");
                         }
                     }
-                    let token = collection.security_tokens.remove(0);
+                    let token = collection.security_tokens.into_iter().next().ok_or(xodus::models::secrets::InvalidTokenResponse)?;
                     let expiry = chrono::DateTime::parse_from_rfc3339(&token.lifetime.expires)?;
-                    let token: Token = token.into();
+                    let token: Token = token.try_into()?;
                     let Token::Compact(user_token) = token else {
                         return Ok(vec![]);
                     };
@@ -133,7 +133,7 @@ pub async fn parse_message(
                     let payload = quick_xml::se::to_string(&payload)?;
                     Ok(payload.as_bytes().to_vec())
                 }
-                _ => todo!("Error handling sill sucks"),
+                _ => Err(xodus::models::secrets::InvalidTokenResponse.into()),
             }
         }
         _ => Err("Unimplemented".into()),
