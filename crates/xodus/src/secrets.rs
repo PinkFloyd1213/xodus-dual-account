@@ -15,6 +15,7 @@ pub fn init_secrets() -> Result<(), keyring_core::Error> {
     {
         #[cfg(target_os = "linux")]
         {
+            activate_desktop_keyring();
             keyring_core::set_default_store(dbus_secret_service_keyring_store::Store::new()?);
         }
 
@@ -33,6 +34,25 @@ pub fn init_secrets() -> Result<(), keyring_core::Error> {
     }
 
     Ok(())
+}
+
+// Some KDE installations advertise ksecretd only under its compatibility
+// activation name. Respect an existing/default Secret Service provider first.
+// This starts a packaged user service, never installs or configures a keyring.
+#[cfg(all(target_os = "linux", not(feature = "key-chain-file")))]
+fn activate_desktop_keyring() {
+    use dbus::blocking::Connection;
+    use std::time::Duration;
+    let Ok(connection) = Connection::new_session() else { return; };
+    let bus = connection.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_secs(3));
+    let Ok((owned,)): Result<(bool,), _> = bus.method_call("org.freedesktop.DBus", "NameHasOwner", ("org.freedesktop.secrets",)) else { return; };
+    if owned { return; }
+    let Ok((names,)): Result<(Vec<String>,), _> = bus.method_call("org.freedesktop.DBus", "ListActivatableNames", ()) else { return; };
+    if names.iter().any(|name| name == "org.freedesktop.secrets") { return; }
+    if names.iter().any(|name| name == "org.kde.secretservicecompat") {
+        // On failure, Store::new below still returns the genuine keyring error.
+        let _: Result<(u32,), _> = bus.method_call("org.freedesktop.DBus", "StartServiceByName", ("org.kde.secretservicecompat", 0u32));
+    }
 }
 
 pub fn get_entry(user: &str) -> Result<keyring_core::Entry, keyring_core::Error> {
