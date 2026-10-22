@@ -84,8 +84,19 @@ async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
 }
 
 pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
-    match tokio::time::timeout(Duration::from_secs(25), profile(tokens)).await {
-        Ok(Ok(value)) => {
+    let account = tokens.get_user().ok().map(|user|user.username);
+    let membership = async {
+        match account.as_deref() {
+            Some(account) => super::subscription::lookup(tokens, account).await,
+            None => json!({"status":"unknown"}),
+        }
+    };
+    // Independent optional membership lookup must not delay the profile request
+    // beyond its existing deadline or trigger interactive authentication.
+    let (result, subscription) = tokio::join!(tokio::time::timeout(Duration::from_secs(25), profile(tokens)), membership);
+    match result {
+        Ok(Ok(mut value)) => {
+            if value["account"].as_str() == account.as_deref() { value["subscription"] = subscription; }
             if json_output { println!("{value}"); } else { println!("{}", value["gamertag"].as_str().unwrap_or_default()); }
             ExitCode::SUCCESS
         }

@@ -2,6 +2,7 @@ use std::process::ExitCode;
 use xodus::tokens::TokenManager;
 
 pub async fn run(tokens: &TokenManager, device: bool) -> ExitCode {
+    super::subscription::clear();
     if device && tokens.remove_device_license().is_err() {
         return ExitCode::FAILURE;
     }
