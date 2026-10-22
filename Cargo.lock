@@ -7209,6 +7209,7 @@ dependencies = [
  "console-subscriber",
  "quick-xml 0.42.0",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

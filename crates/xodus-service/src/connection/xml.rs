@@ -40,6 +40,10 @@ pub async fn parse_message(
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
+        XodusMessageType::StorePackageUpdatesRequest => {
+            let result = crate::store_updates::handle(context, &buffer).await;
+            Ok(quick_xml::se::to_string(&result)?.into_bytes())
+        }
         XodusMessageType::StoreLicenseTokenRequest => {
             // Dedicated request, never silently reinterpret it as Xbox sign-in.
             let result = crate::store_license::handle(context, &buffer).await;
