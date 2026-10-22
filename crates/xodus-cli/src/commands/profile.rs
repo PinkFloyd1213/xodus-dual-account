@@ -47,17 +47,17 @@ fn image_data(bytes: &[u8]) -> Option<String> {
 }
 
 pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Client, String, String), &'static str> {
-    let account = tokens.get_user().map_err(|_| "stored-account")?.username;
-    let Token::Legacy(device) = tokens.get_device_sts_token().map_err(|_| "device-token")? else { return Err("device-token"); };
-    let Token::Legacy(user) = tokens.get_user_sts_token().map_err(|_| "user-token")? else { return Err("user-token"); };
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(8)).user_agent("xodus-nexus-profile/1").build().map_err(|_| "http-client")?;
+        .timeout(super::session::REQUEST_TIMEOUT).user_agent("xodus-nexus-profile/1").build().map_err(|_| "http-client")?;
+    let (account, device, user) = super::session::prepare(tokens, &client).await.map_err(|stage| {
+        super::session::diagnostic(stage); stage
+    })?;
     // Reuse the upstream RPS -> Xbox user -> XSTS exchange. This is a bearer
     // user token (no ProofKey); it must not use the runtime's PoP-bound token.
-    let outcome = xodus::api::live::exchange_user_token(&client, user, account.clone(), device,
+    let outcome = super::session::exchange(|| async { xodus::api::live::exchange_user_token(&client, user.clone(), account.clone(), device.clone(),
         None, Some("Silent".into()), "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".into(),
         &[("user.auth.xboxlive.com".into(), Some(soap::PolicyReference::mbi_ssl()))])
-        .await.map_err(|_| "msa-exchange")?;
+        .await.map_err(|error| super::session::classify(&error)) }).await?;
     let token: Token = match outcome {
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection)) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0).into(),
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => (*response).into(),
@@ -98,7 +98,7 @@ pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
     };
     // Independent optional membership lookup must not delay the profile request
     // beyond its existing deadline or trigger interactive authentication.
-    let (result, subscription) = tokio::join!(tokio::time::timeout(Duration::from_secs(25), profile(tokens)), membership);
+    let (result, subscription) = tokio::join!(tokio::time::timeout(Duration::from_secs(45), profile(tokens)), membership);
     match result {
         Ok(Ok(mut value)) => {
             if value["account"].as_str() == account.as_deref() { value["subscription"] = subscription; }

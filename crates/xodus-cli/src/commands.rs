@@ -9,6 +9,7 @@ pub mod profile;
 pub mod game_activity;
 pub mod achievements;
 pub mod subscription;
+pub mod session;
 pub mod library;
 #[cfg(unix)]
 pub mod run;

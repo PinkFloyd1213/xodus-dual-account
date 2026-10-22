@@ -104,25 +104,24 @@ pub(super) async fn store_session(
     if tokens.get_user().map_err(|_| "stored-account")?.username != account {
         return Err("account-changed");
     }
-    let Token::Legacy(device) = tokens.get_device_sts_token().map_err(|_| "stored-device")? else {
-        return Err("device-token");
-    };
-    let Token::Legacy(user) = tokens.get_user_sts_token().map_err(|_| "stored-user")? else {
-        return Err("user-token");
-    };
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(6))
+        .timeout(super::session::REQUEST_TIMEOUT)
         .user_agent("Xodus-Nexus-membership/0.2.3")
         .build()
         .map_err(|_| "http-client")?;
+    let (selected, device, user) = super::session::prepare(tokens, &client).await.map_err(|stage| {
+        super::session::diagnostic(stage); stage
+    })?;
+    if selected != account { return Err("account-changed"); }
     // Genuine Microsoft Store ticket, not Xbox privileges, browser cookies or
     // a first-party client impersonation. Silent failure never opens another UI.
-    let outcome = xodus::api::live::exchange_user_token(
+    let outcome = super::session::exchange(|| async {
+        xodus::api::live::exchange_user_token(
         &client,
-        user,
+        user.clone(),
         account.into(),
-        device,
+        device.clone(),
         None,
         Some("Silent".into()),
         "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".into(),
@@ -132,7 +131,9 @@ pub(super) async fn store_session(
         )],
     )
     .await
-    .map_err(|_| "store-ticket")?;
+    .map_err(|error| super::session::classify(&error))
+    }).await?;
+    if tokens.get_user().map_err(|_| "account-check")?.username != account { return Err("account-changed"); }
     let token: Token = match outcome {
         ExchangeUserTokenOutcome::Issued(
             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
@@ -198,7 +199,7 @@ pub async fn lookup(tokens: &TokenManager, account: &str) -> Value {
     {
         return value;
     }
-    match tokio::time::timeout(Duration::from_secs(10), query(tokens, account)).await {
+    match tokio::time::timeout(Duration::from_secs(40), query(tokens, account)).await {
         Ok(Ok((sub, until))) => {
             if let Some(entry) = entry {
                 if let Ok(bytes) = serde_json::to_vec(
