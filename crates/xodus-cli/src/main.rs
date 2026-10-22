@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use xodus::tokens::TokenManager;
+use xodus::tokens::{AccountRole, TokenManager};
 
 mod commands;
 mod license;
@@ -15,6 +15,21 @@ mod webview;
 #[cfg(not(feature = "native-webview"))]
 #[path = "webview_stdio.rs"]
 mod webview;
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AccountArg {
+    Store,
+    Play,
+}
+
+impl From<AccountArg> for AccountRole {
+    fn from(account: AccountArg) -> Self {
+        match account {
+            AccountArg::Store => AccountRole::Store,
+            AccountArg::Play => AccountRole::Play,
+        }
+    }
+}
 
 #[derive(Subcommand)]
 enum SubCommand {
@@ -85,23 +100,51 @@ enum SubCommand {
     Account {
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role: store (licenses) or play (in-game identity, falls back to store)"
+        )]
+        account: AccountArg,
     },
     #[command(about = "Read Xbox gamertag and gamerpic for the stored account")]
     Profile {
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role: store (licenses) or play (in-game identity, falls back to store)"
+        )]
+        account: AccountArg,
     },
     #[command(about = "Read Xbox time played and last activity for one title without starting sign-in")]
     GameActivity {
         title_id: u32,
         #[arg(long)]
         json: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role: store (licenses) or play (in-game identity, falls back to store)"
+        )]
+        account: AccountArg,
     },
     #[command(about = "Read achievements for one Xbox title without signing in or unlocking anything")]
     Achievements {
         title_id: u32,
         #[arg(long)]
         json: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role: store (licenses) or play (in-game identity, falls back to store)"
+        )]
+        account: AccountArg,
     },
     #[command(about = "Read account product entitlements without starting sign-in")]
     Library {
@@ -110,10 +153,25 @@ enum SubCommand {
         #[arg(long, default_value = "US")]
         market: String,
     },
-    Login,
+    Login {
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role to sign in: store (licenses) or play (in-game identity)"
+        )]
+        account: AccountArg,
+    },
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role to remove; play removes only the play account"
+        )]
+        account: AccountArg,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
@@ -324,7 +382,11 @@ async fn main() -> ExitCode {
             .await
         }
         SubCommand::Library { json, market } => commands::library::run(&tokens, json, market).await,
-        SubCommand::Account { json } => match tokens.get_user() {
+        SubCommand::Account {
+            json,
+            account: AccountArg::Play,
+        } => commands::account::play(&tokens, json),
+        SubCommand::Account { json, .. } => match tokens.get_user() {
             Ok(user) => {
                 if json {
                     println!(
@@ -352,11 +414,42 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
-        SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
-        SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
-        SubCommand::Login => commands::login::run(&client, &tokens).await,
-        SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
+        SubCommand::Profile { json, account } => match tokens.resolve(account.into()) {
+            Ok(tokens) => commands::profile::run(&tokens, json).await,
+            Err(error) => {
+                error.report();
+                ExitCode::FAILURE
+            }
+        },
+        SubCommand::GameActivity {
+            title_id,
+            json,
+            account,
+        } => match tokens.resolve(account.into()) {
+            Ok(tokens) => commands::game_activity::run(&tokens, title_id, json).await,
+            Err(error) => {
+                error.report();
+                ExitCode::FAILURE
+            }
+        },
+        SubCommand::Achievements {
+            title_id,
+            json,
+            account,
+        } => match tokens.resolve(account.into()) {
+            Ok(tokens) => commands::achievements::run(&tokens, title_id, json).await,
+            Err(error) => {
+                error.report();
+                ExitCode::FAILURE
+            }
+        },
+        // Sign-in and sign-out target exactly the requested role, never a fallback.
+        SubCommand::Login { account } => {
+            commands::login::run(&client, &tokens.for_role(account.into())).await
+        }
+        SubCommand::Logout { device, account } => {
+            commands::logout::run(&tokens.for_role(account.into()), device).await
+        }
         SubCommand::Extract {
             path,
             destination,
