@@ -1,7 +1,19 @@
 # Deux comptes : `store` (licence) et `play` (identité en jeu)
 
-> **Statut : phase 1, cartographie.** Rien n'est implémenté. Ce document attend
-> validation avant la phase 2.
+> **Statut : backend implémenté et testé (branche `dual-account`).** Reste :
+> intégration dans le fork Nexus (lock, connexion du compte `play`, affichage),
+> puis test manuel en jeu.
+>
+> Objectif : reproduire Windows. Le compte qui a le Game Pass (`store`) ne sert
+> qu'aux licences, en arrière-plan, comme le Microsoft Store. Tout ce que
+> l'utilisateur voit (identité en jeu, gamertag, succès, temps de jeu, cloud
+> saves), en jeu comme dans le launcher, est le compte perso (`play`), comme
+> l'app Xbox.
+>
+> Maintenu comme forks ([xodus-dual-account](https://github.com/PinkFloyd1213/xodus-dual-account),
+> [xodus-nexus-dual-account](https://github.com/PinkFloyd1213/xodus-nexus-dual-account)),
+> mais écrit pour rester fusionnable : changements additifs, aucun refactoring,
+> comportement identique tant qu'aucun compte `play` n'est configuré.
 
 ## Base de travail
 
@@ -178,28 +190,150 @@ phase 4 : si Nexus démarre son propre fournisseur de trousseau
 faut alors lancer `xodus-cli login --account play` pendant que Nexus tourne,
 ou après un `keyring-unlock`.
 
-## Design proposé pour la phase 2 (résumé)
+## Décisions (22.10.2026)
 
-- `pub enum AccountRole { Store, Play }` dans `tokens/manager.rs`.
-- Les méthodes utilisateur existantes restent inchangées et signifient `store`,
-  ce qui garde un diff minimal et les appelants `store` intacts. On ajoute
-  `TokenManager::user(role) -> UserTokens<'_>`, une vue qui expose les mêmes
-  opérations (`get_user`, `get_user_sts_token`, `save_user_token`,
-  `save_user_session`, `remove`) sur des clés préfixées `play/` pour `Play`.
-- `TokenManager::resolve(AccountRole::Play) -> AccountRole` est une fonction
-  pure et testable : elle renvoie `Play` si `play/user-session` (ou
-  `play/user-DA`) existe, sinon `Store`. Les appelants `play` font
-  `let view = tokens.user(tokens.resolve(Play)?)` puis lisent et écrivent
-  via `view`.
-- Service : `MsaTokenRequest` passe par la vue résolue, avec un log
-  `role=play|store fallback=bool` sans aucun secret. `StoreLicense` et
-  `StoreUpdates` loguent `role=store`.
-- CLI : `--account <store|play>` (défaut `store`) sur `login`, `logout` et
-  `account`, ainsi que sur `profile`, `achievements` et `game-activity` selon A1.
-  `account --json` ajoute un champ optionnel
-  `"roles":{"store":{"stored":true},"play":{"stored":bool,"fallback":bool,"username"?:…}}`.
-  `username` est absent par défaut pour ne pas exposer d'identifiant complet ;
-  le gamertag vient de `profile --account play`. `run` utilise `play` pour
-  PlayFab.
-- Tests (`MemoryBackend`) : isolation des clés, repli, `logout play`, STS
-  rafraîchi en `play`, et choix du rôle par message du service (fonction pure).
+- **A1** : le backend garde `store` par défaut pour `profile`, `achievements` et
+  `game-activity`, afin que Nexus upstream fonctionne sans changement.
+  `--account play` (avec repli) est ajouté. C'est le **fork Nexus** qui
+  demandera `play` et liera l'affichage à `account --account play`, comme
+  l'app Xbox.
+- **A5** : `logout` sans option garde le comportement actuel et conserve
+  `play`. `logout --account play` ne supprime que `play/*`.
+- **A8** : on passe par le fork Nexus. Le patch est ajouté à son lock, et
+  « Rebuild » produit un backend managed avec `linuxRunPatch` correct. On ne
+  bricole pas `current.json`.
+
+## Design implémenté (ancien titre : « Design proposé pour la phase 2 »)
+
+Commits sur `dual-account` : `tokens: …`, `service: …`, `cli: …`.
+
+**Modèle** (`xodus/src/tokens/manager.rs`)
+
+- `pub enum AccountRole { Store (défaut), Play }`, exporté par `xodus::tokens`.
+- `TokenManager` porte un champ `role`. `new()` donne `Store`, donc **tous les
+  appelants existants sont inchangés**.
+  - `for_role(role)` renvoie le même stockage, limité à un rôle.
+  - `resolve(role)` renvoie `Play` si un compte `play` existe, sinon `Store`.
+    Pour `Store`, il renvoie toujours `Store`.
+  - `has_user()` indique si un compte est stocké pour le rôle.
+- Clés : celles de `store` sont inchangées. `play` utilise
+  `play/user-session`, `play/user-tokens` et `play/user-DA`. `dev_license` et
+  `device-tokens` sont partagés.
+- `remove_persistent()` en `Play` ne supprime que les clés `play/*`. Les device
+  tokens ne sont retirés que par une déconnexion `store`, comme aujourd'hui.
+
+**Service** (`xodus-service/src/connection/xml.rs`)
+
+- `message_role()` est une fonction pure et testée :
+  `MsaTokenRequest` → `Play` ; `StoreLicenseTokenRequest` et
+  `StorePackageUpdatesRequest` → `Store`.
+- `parse_message` résout le rôle une fois par requête, puis loggue au niveau
+  `info` : `message`, `role` et `fallback`, sans identifiant ni token.
+- `MsaTokenRequest` lit le STS et réécrit le STS rafraîchi **dans le rôle
+  résolu**. En repli, c'est donc `store`, exactement comme avant.
+
+**CLI**
+
+| Commande | Défaut (inchangé) | `--account play` |
+|---|---|---|
+| `login` | `store` ; le cache d'abonnement est vidé | connecte `play` uniquement, le cache d'abonnement est conservé |
+| `logout [--device]` | `store` + device tokens + cache ; `play` conservé | ne supprime que `play/*` ; refuse `--device` |
+| `account [--json]` | sortie strictement identique | `{"role":"play"\|"store","fallback":bool,"stored":bool,"username"?}` : le compte qu'un jeu utiliserait |
+| `profile` | inchangé | gamertag/gamerpic de `play` (repli `store`) ; l'abonnement vient toujours de `store` |
+| `achievements`, `game-activity` | inchangés | données de `play` (repli `store`) ; `account` dans la sortie = compte effectif |
+| `run` | — | XSTS PlayFab (`XODUS_XSTS_PLAYFAB`) via `play`, avec repli ; licence de contenu via `store` |
+| `library`, `streaming`, `download`, `license`, `extract` | `store` | pas d'option, toujours `store` |
+
+`login --account play` passe par le même transport que `login` : la webview
+native, ou `--external-webview-stdio` piloté par Nexus. **Le binaire compilé
+comme Nexus (`--no-default-features`) n'a pas de webview native.** Depuis un
+terminal, `login` échoue donc avec « sign-in UI » non disponible. La connexion
+du compte `play` doit être faite par le fork Nexus. Autre possibilité : un
+build de diagnostic avec webview (`cargo build --release -p xodus-cli`, qui
+demande `webkit2gtk4.1-devel`, à installer avec sudo).
+
+**Tests** (`xodus/src/tokens/dual_account_tests.rs`, préfixe `credential_` pour
+être exécutés par `build-backend.mjs` ; `xml.rs` : `store_and_play_message_roles`)
+
+- les clés historiques sont conservées ; isolation des rôles ;
+- repli `play → store`, y compris sur les entrées `store` à l'ancien format ;
+- `logout play` garde `store` et l'appareil ; `logout store` garde `play` ;
+- un STS `play` rafraîchi ne touche pas `store` ; un rafraîchissement en
+  repli reste dans `store` et ne crée pas de compte `play`.
+
+**Vérifications** (rustc 1.99.0)
+
+- La séquence complète de `cargo test` de `build-backend.mjs`, plus
+  `cargo test -p xodus` : tout passe.
+- `cargo clippy --all-targets` : 35 avertissements avant et après, à
+  l'identique. Aucun nouvel avertissement.
+- `rustfmt` : le code ajouté est formaté. Les fichiers patchés par Nexus ne
+  l'étaient déjà pas ; je ne les ai pas reformatés.
+- Build release : `--help` expose toujours tout ce que
+  `parseBackendHelp`/`validate()`/`build-backend.mjs` attendent, et
+  `--account` est présent sur les six commandes.
+
+## Patch pour Nexus
+
+`scripts/dual-account-patch.sh` produit `xodus-dual-account.patch` à partir de
+`git diff nexus-base..dual-account -- crates`. Ce patch s'applique avec
+`git apply --check` puis `git apply` après les 38 patches du lock, et le
+résultat est identique à `dual-account`. Entrée à ajouter **en dernier** dans
+`patches` :
+
+```json
+{ "file": "xodus-dual-account.patch", "sha256": "73d6c752c74ec5372cf8cdc61eb0c8e14958f03d13efa36d95cba5a9f27e5d0a" }
+```
+
+Dans le fork Nexus, il faut aussi changer `patchId`, qui identifie la recette
+(par exemple `linux-run-v38-dual-account-1`). `compatibility` reste à
+`linux-run-v22`, puisque le contrat de lancement ne change pas. Avec ça,
+**Rebuild** construit un backend managed qui peut lancer les jeux.
+
+Attention : **Update** (binaire précompilé publié par Nexus upstream)
+remplacerait ce backend par un backend sans double compte. Ce n'est pas
+destructif (les clés `play/*` sont simplement ignorées), mais le fork Nexus
+devra pointer ses releases vers le fork, ou désactiver Update.
+
+## Mise à jour quand Nexus change
+
+1. `git -C xodus-nexus fetch upstream` et fusion dans le fork Nexus ; lire le
+   nouveau `assets/backend-source.lock.json`.
+2. Dans `xodus-backend` (arbre propre) : `scripts/nexus-base.sh ../xodus-nexus nexus-base-next`.
+   Le script s'arrête si un patch ne s'applique pas ou si un sha256 diffère.
+3. `git rebase --onto nexus-base-next nexus-base dual-account`, puis renommer
+   `nexus-base-next` en `nexus-base`. Les conflits se limitent aux fichiers
+   listés ci-dessus.
+4. Si le lock change de version de Rust : `rustup toolchain install <rust>`
+   puis `rustup override set <rust>`.
+5. Rejouer les tests (section Vérifications), puis
+   `scripts/dual-account-patch.sh` et reporter le nouveau sha256 dans le lock
+   du fork Nexus.
+
+## Plan de test manuel (après intégration Nexus)
+
+1. Sans compte `play` : tout se comporte comme avant (`account --account play`
+   indique `"fallback": true`).
+2. Connecter `play` par le fork Nexus, puis relancer le jeu (voir A6).
+3. Jeu de référence du wiki Compatibility de Nexus (Deep Rock Galactic, Gears
+   of War: E-Day…) :
+   - installation via `store` ;
+   - lancement ;
+   - gamertag en jeu = `play` ;
+   - cloud saves et succès de `play`.
+4. Logs du service (`XODUS_LOG=xodus_service=info`) : `role="play"` sur
+   `MsaTokenRequest`, `role="store"` sur `StoreLicenseTokenRequest` et
+   `StorePackageUpdatesRequest`. Ne pas utiliser `scripts/send_msa_token_request.py` :
+   il affiche le token reçu.
+5. Symptômes possibles si un jeu croise le Store avec le joueur (A2) :
+   - DLC ou contenu payant non reconnu alors que `store` le possède ;
+   - échec de reçu ou de licence en cours de partie ;
+   - monnaie virtuelle absente.
+
+   Diagnostic : logs du service (`Store license token request failed`,
+   `hresult`), puis comparer avec `logout --account play` (retour en mode
+   compte unique). Si le problème disparaît, c'est une vérification croisée
+   côté éditeur, et Windows se comporterait pareil.
+6. Sauvegardes locales créées avant le passage à `play` : elles ne sont plus
+   visibles (A7). C'est attendu, et c'est la sauvegarde cloud de `play` qui
+   prend le relais.
