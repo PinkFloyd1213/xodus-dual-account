@@ -10,6 +10,31 @@ use crate::models::soap;
 mod rst;
 mod utils;
 
+/// Fixed diagnostic categories, never error text, XML, keys or account data.
+pub fn exchange_failure_stage(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    use rst::RSTError;
+    Some(match error.downcast_ref::<RSTError>()? {
+        RSTError::Request(_) => return None,
+        RSTError::Serialization(_) | RSTError::Builder(_) => "ticket-request-build",
+        RSTError::Deserialization(_) => "ticket-response-parse",
+        RSTError::InvalidResponseSignature(_) => "ticket-response-signature",
+        _ => "ticket-response-crypto",
+    })
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn ticket_diagnostic_classifies_without_disclosing_error_payloads() {
+        let xml = quick_xml::de::from_str::<soap::Envelope>("<private-email-secret>").unwrap_err();
+        assert_eq!(exchange_failure_stage(&rst::RSTError::Deserialization(xml)), Some("ticket-response-parse"));
+        assert_eq!(exchange_failure_stage(&rst::RSTError::InvalidResponseSignature("private-email-secret".into())), Some("ticket-response-signature"));
+        assert_eq!(exchange_failure_stage(&rst::RSTError::MissingNonce), Some("ticket-response-crypto"));
+        assert_eq!(exchange_failure_stage(&std::io::Error::other("private-email-secret")), None);
+    }
+}
+
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 
 pub async fn login_device_credential(

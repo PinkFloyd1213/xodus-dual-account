@@ -89,6 +89,10 @@ pub enum Failure {
     Connect,
     Network,
     Response,
+    Build,
+    Parse,
+    Signature,
+    Crypto,
 }
 impl Failure {
     fn stage(self) -> &'static str {
@@ -97,10 +101,14 @@ impl Failure {
             Self::Connect => "ticket-connect",
             Self::Network => "ticket-network",
             Self::Response => "ticket-response",
+            Self::Build => "ticket-request-build",
+            Self::Parse => "ticket-response-parse",
+            Self::Signature => "ticket-response-signature",
+            Self::Crypto => "ticket-response-crypto",
         }
     }
     fn retry(self) -> bool {
-        self != Self::Response
+        matches!(self, Self::Timeout | Self::Connect | Self::Network)
     }
 }
 pub fn classify(error: &(dyn Error + 'static)) -> Failure {
@@ -109,6 +117,13 @@ pub fn classify(error: &(dyn Error + 'static)) -> Failure {
         let Some(error) = current else {
             break;
         };
+        match xodus::api::live::exchange_failure_stage(error) {
+            Some("ticket-request-build") => return Failure::Build,
+            Some("ticket-response-parse") => return Failure::Parse,
+            Some("ticket-response-signature") => return Failure::Signature,
+            Some("ticket-response-crypto") => return Failure::Crypto,
+            _ => {}
+        }
         if let Some(request) = error.downcast_ref::<reqwest::Error>() {
             return if request.is_timeout() {
                 Failure::Timeout
@@ -123,6 +138,26 @@ pub fn classify(error: &(dyn Error + 'static)) -> Failure {
         current = error.source();
     }
     Failure::Response
+}
+
+fn service_code(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let raw = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")).unwrap_or(raw);
+    (raw.len() == 8 && raw.bytes().all(|b| b.is_ascii_hexdigit())).then(|| raw.to_ascii_uppercase())
+}
+
+/// A SOAP fault is a refusal, not a transient transport error. Do not retry it,
+/// follow its URL or discard credentials. Only its bounded public code is logged.
+pub fn rejection(outcome: &xodus::models::live::ExchangeUserTokenOutcome) -> Option<&'static str> {
+    use xodus::models::live::ExchangeUserTokenOutcome;
+    let ExchangeUserTokenOutcome::Fault(pp) = outcome else { return None; };
+    let stage = if pp.as_ref().and_then(|pp| pp.inline_auth_url.as_deref()).is_some_and(|url| !url.is_empty()) {
+        "ticket-interaction-required"
+    } else { "ticket-refused" };
+    if let Some(code) = service_code(pp.as_ref().and_then(|pp| pp.req_status.as_deref())) {
+        eprintln!("NEXUS_TICKET_DIAGNOSTIC_V1 {stage} {code}");
+    } else { diagnostic(stage); }
+    Some(stage)
 }
 pub async fn exchange<T, F, Fut>(mut request: F) -> Result<T, &'static str>
 where
@@ -163,6 +198,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ticket_fault_classification_and_provider_codes_are_strictly_bounded() {
+        use xodus::models::live::ExchangeUserTokenOutcome;
+        for raw in ["800488ab", "0x800488AB", "0X800488ab"] {
+            assert_eq!(service_code(Some(raw)).as_deref(), Some("800488AB"));
+        }
+        for raw in ["", "1234567", "123456789", "private@example.test", "800488AB secret", "800488AB\n", "0x800488AZ"] {
+            assert_eq!(service_code(Some(raw)), None);
+        }
+        assert_eq!(service_code(None), None);
+        assert_eq!(rejection(&ExchangeUserTokenOutcome::Fault(None)), Some("ticket-refused"));
+        let pp: xodus::models::soap::PP = serde_json::from_value(serde_json::json!({"reqstatus":"0x800488ab", "inlineauthurl":"https://private.example.test/?secret=never-log"})).unwrap();
+        assert_eq!(rejection(&ExchangeUserTokenOutcome::Fault(Some(pp))), Some("ticket-interaction-required"));
+    }
     use std::{cell::Cell, future::ready};
     use xodus::{
         models::{
@@ -326,6 +375,10 @@ mod tests {
             Failure::Connect,
             Failure::Network,
             Failure::Response,
+            Failure::Build,
+            Failure::Parse,
+            Failure::Signature,
+            Failure::Crypto,
         ] {
             let calls = Cell::new(0);
             let waits = Cell::new(0);
