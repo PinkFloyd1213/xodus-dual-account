@@ -7204,6 +7204,7 @@ dependencies = [
 name = "xodus-service"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "console-subscriber",
  "quick-xml 0.42.0",

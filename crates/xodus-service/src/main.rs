@@ -11,6 +11,7 @@ use xodus::tokens::TokenManager;
 
 mod connection;
 mod simple_context;
+mod store_license;
 mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;

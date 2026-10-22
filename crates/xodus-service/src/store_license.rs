@@ -1,0 +1,101 @@
+//! Real Store receipt issuance. No locally generated JWTs or entitlement grants.
+use std::time::Duration;
+use xodus::models::{live::ExchangeUserTokenOutcome, secrets::Token, soap};
+use xodus::models::licensing::{LicenseTokenRequest, LicenseTokenResponse, LicenseUserIdentity};
+use xodus::models::xgameruntime::xuser::{StoreLicenseTokenRequest, StoreLicenseTokenResponse};
+use crate::simple_context::SimpleContext;
+
+const FAIL: u32 = 0x80004005;
+const INVALID: u32 = 0x80070057;
+const DENIED: u32 = 0x80070005;
+
+fn valid(req: &StoreLicenseTokenRequest) -> bool {
+    let id_ok = |id: &str| !id.is_empty() && id.len() <= 32 && id.bytes().all(|c| c.is_ascii_alphanumeric());
+    id_ok(&req.parent_product_id) && !req.product_ids.is_empty() && req.product_ids.len() <= 64
+        && req.product_ids.iter().all(|id| id_ok(id))
+        && !req.custom_developer_string.is_empty() && req.custom_developer_string.len() <= 4096
+}
+
+pub async fn handle(context: &SimpleContext, body: &[u8]) -> StoreLicenseTokenResponse {
+    let request = std::str::from_utf8(body).ok()
+        .and_then(|text| quick_xml::de::from_str::<StoreLicenseTokenRequest>(text).ok());
+    let result = match request {
+        Some(req) if valid(&req) => tokio::time::timeout(Duration::from_secs(90), issue(context, req))
+            .await.unwrap_or(Err(FAIL)),
+        _ => Err(INVALID),
+    };
+    match result {
+        Ok(token) => StoreLicenseTokenResponse { hresult: 0, token },
+        Err(hresult) => {
+            tracing::warn!(hresult, "Store license token request failed");
+            StoreLicenseTokenResponse { hresult, token: String::new() }
+        }
+    }
+}
+
+async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Result<String, u32> {
+    let device = context.device_token.as_ref().ok_or(DENIED)?.clone();
+    let Token::Legacy(user_sts) = context.tokens().get_user_sts_token().map_err(|_| DENIED)? else { return Err(DENIED) };
+    let account = context.tokens().get_user().map_err(|_| DENIED)?;
+    // Same genuine MSA audience/client used by upstream's content licensing.
+    let client_id = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
+    let device_response = xodus::api::live::exchange_device_token(&context.client, device.clone(),
+        client_id.into(), "www.microsoft.com".into(), Some(soap::PolicyReference::mbi_ssl()))
+        .await.map_err(|_| FAIL)?;
+    if device_response.token_type != "urn:passport:compact" { return Err(FAIL) }
+    let Token::Compact(device_token) = device_response.into() else { return Err(FAIL) };
+    let user_response = xodus::api::live::exchange_user_token(&context.client, user_sts,
+        account.username, device, None, Some("Silent".into()), client_id.into(),
+        &[("www.microsoft.com".into(), Some(soap::PolicyReference::mbi_ssl()))])
+        .await.map_err(|_| FAIL)?;
+    let response = match user_response {
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) =>
+            collection.security_tokens.into_iter().find(|r| r.token_type == "urn:passport:compact").ok_or(FAIL)?,
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => *response,
+        _ => return Err(DENIED),
+    };
+    if response.token_type != "urn:passport:compact" { return Err(FAIL) }
+    let Token::Compact(user_token) = response.into() else { return Err(FAIL) };
+    let mut response = context.client.post("https://licensing.mp.microsoft.com/v8.0/licenseToken")
+        .timeout(Duration::from_secs(60)).header("from", "XboxLicenseManager")
+        .header("Authorization", device_token).header("User-Agent", "XboxGameRuntime")
+        .json(&LicenseTokenRequest {
+            parent_product_id: request.parent_product_id, enforce_sellable_by: true,
+            related_product_ids: request.product_ids, custom_developer_string: request.custom_developer_string,
+            beneficiaries: vec![LicenseUserIdentity { identity_type: "Msa".into(),
+                identity_value: user_token, local_ticket_reference: account.puid }],
+        }).send().await.map_err(|_| FAIL)?;
+    if !response.status().is_success() {
+        return Err(if matches!(response.status().as_u16(), 401 | 403) { DENIED } else { FAIL });
+    }
+    if response.content_length().is_some_and(|n| n > 60000) { return Err(FAIL) }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| FAIL)? {
+        if body.len() + chunk.len() > 60000 { return Err(FAIL) }
+        body.extend_from_slice(&chunk);
+    }
+    let response: LicenseTokenResponse = serde_json::from_slice(&body).map_err(|_| FAIL)?;
+    if response.license_token.is_empty() || response.license_token.len() > 48000 { return Err(FAIL) }
+    Ok(response.license_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_empty_or_invalid_request() {
+        let mut req = StoreLicenseTokenRequest { parent_product_id: "9N4PT8HGCDHQ".into(),
+            product_ids: vec!["9N4PT8HGCDHQ".into()], custom_developer_string: "probe<&>".into() };
+        assert!(valid(&req));
+        req.custom_developer_string.clear(); assert!(!valid(&req));
+        req.custom_developer_string = "nonce".into(); req.product_ids[0] = "bad/id".into();
+        assert!(!valid(&req));
+    }
+    #[test]
+    fn xml_preserves_exact_nonce_and_multiple_ids() {
+        let req: StoreLicenseTokenRequest = quick_xml::de::from_str(
+            "<StoreLicenseTokenRequest><ParentProductId>9N4PT8HGCDHQ</ParentProductId><ProductId>9N4PT8HGCDHQ</ProductId><ProductId>OTHER</ProductId><CustomDeveloperString>probe&lt;&amp;&gt;</CustomDeveloperString></StoreLicenseTokenRequest>").unwrap();
+        assert_eq!(req.product_ids.len(), 2);
+        assert_eq!(req.custom_developer_string, "probe<&>");
+    }
+}
