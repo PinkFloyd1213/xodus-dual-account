@@ -60,6 +60,13 @@ enum SubCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Read account product entitlements without starting sign-in")]
+    Library {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value = "US")]
+        market: String,
+    },
     Login,
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
@@ -188,6 +195,7 @@ async fn main() -> ExitCode {
         args.command,
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
+            | SubCommand::Library { .. }
             | SubCommand::Clep { .. }
             | SubCommand::SpLicense { .. }
             | SubCommand::Logout { .. }
@@ -216,6 +224,7 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        SubCommand::Library { json, market } => commands::library::run(&tokens, json, market).await,
         SubCommand::Account { json } => match tokens.get_user() {
             Ok(user) => {
                 if json {
