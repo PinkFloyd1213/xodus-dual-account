@@ -33,10 +33,20 @@ pub(super) async fn settle<W: AsyncWrite + Unpin>(
     Ok(())
 }
 pub(super) fn report(error: &(dyn std::error::Error + 'static)) {
-    let error = error
-        .downcast_ref::<TransferError>()
-        .copied()
-        .unwrap_or(TransferError::new("transfer-io", 0));
+    report_as(error, "transfer-io");
+}
+pub(super) fn report_metadata(error: &(dyn std::error::Error + 'static)) {
+    report_as(error, "metadata-invalid");
+}
+fn report_as(mut error: &(dyn std::error::Error + 'static), stage: &'static str) {
+    let mut found = None;
+    for _ in 0..8 {
+        if let Some(value) = error.downcast_ref::<TransferError>() { found = Some(*value); break; }
+        if let Some(inner) = error.downcast_ref::<std::io::Error>().and_then(|error| error.get_ref()) { error = inner; }
+        else if let Some(inner) = error.source() { error = inner; }
+        else { break; }
+    }
+    let error = found.unwrap_or(TransferError::new(stage, 0));
     eprintln!("{}", error.diagnostic());
     eprintln!("{error} Retry this installation to obtain a fresh package link and resume safely.");
 }

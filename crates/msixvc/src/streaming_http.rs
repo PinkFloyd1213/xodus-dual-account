@@ -58,9 +58,9 @@ impl Default for Policy {
     }
 }
 type Body = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
-pub(crate) struct RangeReader<'a> {
-    client: &'a reqwest::Client,
-    url: &'a str,
+pub(crate) struct RangeReader {
+    client: reqwest::Client,
+    url: String,
     position: u64,
     end: u64,
     response_end: u64,
@@ -69,19 +69,13 @@ pub(crate) struct RangeReader<'a> {
     pending: Bytes,
     policy: Policy,
     failures: u32,
-    last_progress: Instant,
+    idle_spent: Duration,
 }
-impl<'a> RangeReader<'a> {
-    pub fn new(
-        client: &'a reqwest::Client,
-        url: &'a str,
-        start: u64,
-        end: u64,
-        policy: Policy,
-    ) -> Self {
+impl RangeReader {
+    pub fn new(client: &reqwest::Client, url: &str, start: u64, end: u64, policy: Policy) -> Self {
         Self {
-            client,
-            url,
+            client: client.clone(),
+            url: url.to_owned(),
             position: start,
             end,
             response_end: end,
@@ -90,19 +84,30 @@ impl<'a> RangeReader<'a> {
             pending: Bytes::new(),
             policy,
             failures: 0,
-            last_progress: Instant::now(),
+            idle_spent: Duration::ZERO,
         }
+    }
+    pub(crate) fn from_response(
+        client: &reqwest::Client,
+        url: &str,
+        start: u64,
+        len: u64,
+        response: reqwest::Response,
+        policy: Policy,
+    ) -> Self {
+        let mut reader = Self::new(client, url, start, len.saturating_sub(1), policy);
+        reader.total = Some(len);
+        reader.body = Some(Box::pin(response.bytes_stream()));
+        reader
     }
     pub fn disconnect(&mut self) {
         self.body = None;
         self.pending = Bytes::new();
         self.failures = 0;
-        self.last_progress = Instant::now();
+        self.idle_spent = Duration::ZERO;
     }
     fn remaining(&self) -> Duration {
-        self.policy
-            .budget
-            .saturating_sub(self.last_progress.elapsed())
+        self.policy.budget.saturating_sub(self.idle_spent)
     }
     async fn retry(&mut self, error: TransferError) -> Result<(), TransferError> {
         // Never poll an exhausted/broken old stream after a reconnect fails.
@@ -119,6 +124,7 @@ impl<'a> RangeReader<'a> {
             return Err(error);
         }
         sleep(delay).await;
+        self.idle_spent += delay;
         Ok(())
     }
     pub async fn next(&mut self) -> Result<Option<Bytes>, TransferError> {
@@ -127,15 +133,17 @@ impl<'a> RangeReader<'a> {
                 return Ok(None);
             }
             if !self.pending.is_empty() {
-                let len=self.pending.len().min(16*1024);
+                let len = self.pending.len().min(16 * 1024);
                 // Intentional throttling is outside the network timeout and
                 // survives control cancellation without losing buffered bytes.
                 crate::bandwidth::acquire(len).await;
-                let bytes=self.pending.split_to(len);
-                self.position+=len as u64;
-                self.failures=0;
-                self.last_progress=Instant::now();
-                if self.position>self.response_end {self.body=None;}
+                let bytes = self.pending.split_to(len);
+                self.position += len as u64;
+                self.failures = 0;
+                self.idle_spent = Duration::ZERO;
+                if self.position > self.response_end {
+                    self.body = None;
+                }
                 return Ok(Some(bytes));
             }
             let limit = self.policy.timeout.min(self.remaining());
@@ -145,10 +153,13 @@ impl<'a> RangeReader<'a> {
             if self.body.is_none() {
                 let request = self
                     .client
-                    .get(self.url)
+                    .get(&self.url)
                     .header(ACCEPT_ENCODING, "identity")
                     .header(RANGE, format!("bytes={}-{}", self.position, self.end));
-                let response = match timeout(limit, request.send()).await {
+                let started = Instant::now();
+                let response = timeout(limit, request.send()).await;
+                self.idle_spent += started.elapsed();
+                let response = match response {
                     Err(_) => {
                         self.retry(TransferError::new("transfer-headers-timeout", 0))
                             .await?;
@@ -191,17 +202,19 @@ impl<'a> RangeReader<'a> {
                 self.response_end = last;
                 self.body = Some(Box::pin(response.bytes_stream()));
             }
+            let started = Instant::now();
             let next = timeout(
                 self.policy.timeout.min(self.remaining()),
                 self.body.as_mut().unwrap().next(),
             )
             .await;
+            self.idle_spent += started.elapsed();
             match next {
                 Ok(Some(Ok(bytes))) if !bytes.is_empty() => {
                     if bytes.len() as u64 > self.response_end - self.position + 1 {
                         return Err(TransferError::new("transfer-size", 206));
                     }
-                    self.pending=bytes;
+                    self.pending = bytes;
                 }
                 Ok(Some(Ok(_))) => {
                     self.retry(TransferError::new("transfer-eof", 0)).await?;

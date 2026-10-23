@@ -9,6 +9,31 @@ fn policy() -> Policy {
         retries: 2,
     }
 }
+
+#[tokio::test]
+async fn streaming_http_disk_or_consumer_delay_is_not_network_idle_time() {
+    let (url, task) = server(vec![
+        reply(206, "bytes 0-0/2", "a"),
+        reply(206, "bytes 1-1/2", "b"),
+    ])
+    .await;
+    let client = reqwest::Client::new();
+    let mut reader = RangeReader::new(
+        &client,
+        &url,
+        0,
+        1,
+        Policy {
+            budget: Duration::from_millis(100),
+            ..policy()
+        },
+    );
+    assert_eq!(reader.next().await.unwrap().unwrap(), "a");
+    sleep(Duration::from_millis(150)).await;
+    assert_eq!(reader.next().await.unwrap().unwrap(), "b");
+    assert!(reader.next().await.unwrap().is_none());
+    assert_eq!(task.await.unwrap().len(), 2);
+}
 fn reply(status: u16, range: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Range: {range}\r\nConnection: close\r\n\r\n{body}",
@@ -45,7 +70,7 @@ async fn server(replies: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<St
         task,
     )
 }
-async fn collect(reader: &mut RangeReader<'_>) -> Result<Vec<u8>, TransferError> {
+async fn collect(reader: &mut RangeReader) -> Result<Vec<u8>, TransferError> {
     let mut bytes = vec![];
     while let Some(chunk) = reader.next().await? {
         bytes.extend_from_slice(&chunk);

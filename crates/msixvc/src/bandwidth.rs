@@ -1,13 +1,9 @@
 //! One aggregate payload limit for all HTTP streams in this downloader process.
-use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
 use std::{
-    pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::sync::{Mutex, watch};
-const CHUNK: usize = 16 * 1024;
 static SHARED: OnceLock<Arc<Limiter>> = OnceLock::new();
 fn shared() -> &'static Arc<Limiter> {
     SHARED.get_or_init(|| Arc::new(Limiter::new(0)))
@@ -54,25 +50,6 @@ impl Limiter {
         }
     }
 }
-pub(crate) fn limit_body(
-    body: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> {
-    Box::pin(futures_util::stream::unfold(
-        (Box::pin(body), Bytes::new()),
-        |(mut body, mut pending)| async move {
-            while pending.is_empty() {
-                match body.next().await? {
-                    Ok(bytes) => pending = bytes,
-                    Err(error) => return Some((Err(error), (body, pending))),
-                }
-            }
-            let len = pending.len().min(CHUNK);
-            acquire(len).await;
-            Some((Ok(pending.split_to(len)), (body, pending)))
-        },
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

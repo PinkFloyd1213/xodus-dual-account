@@ -14,6 +14,33 @@ pub(super) struct Journal {
     entries: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Trim stale tails even when the complete new file has zero bytes.
+pub(super) async fn prepare_output(file: &mut tokio::fs::File, offset: u64) -> io::Result<()> {
+    use tokio::io::AsyncSeekExt;
+    file.set_len(offset).await?;
+    file.seek(SeekFrom::Start(offset)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn streaming_updated_file_is_trimmed_even_when_its_expected_length_is_zero_or_complete() {
+    for offset in [0, 4] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("updated.bin");
+        std::fs::write(&path, b"old-content").unwrap();
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        prepare_output(&mut file, offset).await.unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            &b"old-content"[..offset as usize]
+        );
+    }
+}
+
 pub(super) fn lock(root: &Path) -> io::Result<File> {
     let path = target(root, ".nexus-streaming.lock")?;
     let file = fs::OpenOptions::new()
