@@ -7,6 +7,10 @@ use wry::http::{HeaderMap, HeaderValue};
 use wry::{PageLoadEvent, WebView, WebViewBuilder};
 use xodus::models::live::{DAProperty, HostBridgeMessage};
 
+#[cfg(test)]
+#[path = "webview_host_tests.rs"]
+mod hosted_signin_tests;
+
 type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -110,11 +114,10 @@ impl WebviewRequest {
     }
 }
 
-pub fn login_request(client_id: String, market: String) -> WebviewRequest {
+// Every hosted sign-in leg needs the same broker identity. Correlation IDs
+// identify individual requests and must not be reused between legs.
+fn host_headers() -> HeaderMap {
     let uid = uuid::Uuid::new_v4();
-    let url = format!(
-        "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&scid=3&mkt={market}&Platform=Windows10&clientid={client_id}&hosted=1"
-    );
 
     let mut headers = HeaderMap::new();
     headers.insert("cxh-capabilities", HeaderValue::from_static(r#"{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}"#));
@@ -144,11 +147,18 @@ pub fn login_request(client_id: String, market: String) -> WebviewRequest {
         HeaderValue::from_static(r#"CloudExperienceHost"#),
     );
 
-    WebviewRequest::new("Xodus login", url, headers)
+    headers
+}
+
+pub fn login_request(client_id: String, market: String) -> WebviewRequest {
+    let url = format!(
+        "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&scid=3&mkt={market}&Platform=Windows10&clientid={client_id}&hosted=1"
+    );
+    WebviewRequest::new("Xodus login", url, host_headers())
 }
 
 pub fn finalize_request(url: String) -> WebviewRequest {
-    WebviewRequest::new("Xodus login", url, HeaderMap::new())
+    WebviewRequest::new("Xodus login", url, host_headers())
 }
 
 pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>

@@ -6,6 +6,10 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use xodus::models::live::{DAProperty, HostBridgeMessage};
 
+#[cfg(test)]
+#[path = "webview_host_tests.rs"]
+mod hosted_signin_tests;
+
 type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
 const LIMIT: usize = 128 * 1024;
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -59,7 +63,9 @@ impl RuntimeCommands {
         self.actions.push(Action::Close(id));
     }
 }
-pub fn login_request(client_id: String, market: String) -> WebviewRequest {
+// Every hosted sign-in leg needs the same broker identity. Correlation IDs
+// identify individual requests and must not be reused between legs.
+fn host_headers() -> HeaderMap {
     let uid = uuid::Uuid::new_v4();
     let mut headers = HeaderMap::new();
     headers.insert("cxh-capabilities",HeaderValue::from_static(r#"{"PrivatePropertyBag":1,"PasswordlessConnect":1,"PreferAssociate":1,"ChromelessUI":0}"#));
@@ -85,19 +91,22 @@ pub fn login_request(client_id: String, market: String) -> WebviewRequest {
     headers.insert("cxh-protocol", HeaderValue::from_static("TokenBroker"));
     headers.insert("cxh-source", HeaderValue::from_static("TokenBroker"));
     headers.insert("hostapp", HeaderValue::from_static("CloudExperienceHost"));
+    headers
+}
+pub fn login_request(client_id: String, market: String) -> WebviewRequest {
     WebviewRequest {
         title: "Xodus sign in".into(),
         url: format!(
             "https://login.live.com/ppsecure/InlineLogin.srf?id=80604&scid=3&mkt={market}&Platform=Windows10&clientid={client_id}&hosted=1"
         ),
-        headers,
+        headers: host_headers(),
     }
 }
 pub fn finalize_request(url: String) -> WebviewRequest {
     WebviewRequest {
         title: "Completing Xodus sign-in".into(),
         url,
-        headers: HeaderMap::new(),
+        headers: host_headers(),
     }
 }
 fn emit(out: &mut impl Write, value: Value) -> HandlerResult<()> {
@@ -325,5 +334,24 @@ mod tests {
         );
         assert_eq!(request.headers.len(), 9);
         assert_eq!(request.headers["hostapp"], "CloudExperienceHost");
+    }
+
+    #[test]
+    fn hosted_signin_transport_emits_complete_headers_on_the_second_leg() {
+        let (result, frames) = fixture(vec![
+            json!({"type":"hello","version":1}), token(1), token(2),
+        ]);
+        assert_eq!(result.unwrap(), Some(2));
+        let opens = frames.iter().filter(|frame| frame["type"] == "open").collect::<Vec<_>>();
+        assert_eq!(opens.len(), 2);
+        assert_eq!(opens[0]["session"], 1);
+        assert_eq!(opens[1]["session"], 2);
+        assert_eq!(opens[1]["url"], "https://login.live.com/finish");
+        let mut first = opens[0]["headers"].as_object().unwrap().clone();
+        let mut second = opens[1]["headers"].as_object().unwrap().clone();
+        assert_eq!(first.len(), 9);
+        assert_eq!(second.len(), 9);
+        assert_ne!(first.remove("cxh-correlationid"), second.remove("cxh-correlationid"));
+        assert_eq!(first, second);
     }
 }
