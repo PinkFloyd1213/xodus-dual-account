@@ -9,6 +9,7 @@ use xodus::tokens::TokenManager;
 mod commands;
 mod license;
 mod package;
+mod package_plan;
 #[cfg(feature = "native-webview")]
 mod webview;
 #[cfg(not(feature = "native-webview"))]
@@ -17,6 +18,14 @@ mod webview;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[command(about = "Resolve public Store packages without sign-in or downloading")]
+    ResolvePackage {
+        product: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "US")]
+        market: String,
+    },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
         product: String,
@@ -80,6 +89,8 @@ enum SubCommand {
     Streaming {
         source: String,
         destination: String,
+        #[arg(long, help = "Content ID explicitly selected from resolve-package for this Store product")]
+        selected_content_id: Option<String>,
         #[arg(
             long,
             help = "Emit Nexus progress protocol v1 as newline-delimited JSON"
@@ -165,7 +176,7 @@ struct CliArgs {
 async fn main() -> ExitCode {
     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
     let registry =
-        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter));
 
     #[cfg(feature = "tokio_console")]
     {
@@ -193,6 +204,13 @@ async fn main() -> ExitCode {
         webview::enable_stdio();
     }
 
+    // Public preflight must not activate a keyring, provision a device or sign in.
+    if let SubCommand::ResolvePackage { product, json: _, market } = &args.command {
+        return match package_plan::resolve(&client, &product.to_uppercase(), &market.to_uppercase()).await {
+            Ok(plan) => { println!("{}", plan.json(&product.to_uppercase(), &market.to_uppercase())); ExitCode::SUCCESS },
+            Err(error) => { eprintln!("{error}"); ExitCode::FAILURE },
+        };
+    }
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
 
@@ -216,6 +234,7 @@ async fn main() -> ExitCode {
     }
 
     let code = match args.command {
+        SubCommand::ResolvePackage { .. } => unreachable!(),
         SubCommand::Download {
             product,
             market,
@@ -289,6 +308,7 @@ async fn main() -> ExitCode {
         SubCommand::Streaming {
             source,
             destination,
+            selected_content_id,
             progress_json,
             control_stdin,
             try_skip_ntfs,
@@ -305,6 +325,7 @@ async fn main() -> ExitCode {
                 market,
                 progress_json,
                 control_stdin,
+                selected_content_id,
             )
             .await
         }
