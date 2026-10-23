@@ -33,6 +33,10 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         _ => unreachable!(),
     };
 
+    #[cfg(not(feature = "native-webview"))]
+    if issued_tokens.is_empty() {
+        return ExitCode::FAILURE;
+    }
     for token in issued_tokens {
         let address = token.applies_to.endpoint_reference.address.clone();
         let token = token.into();

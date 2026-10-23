@@ -9,6 +9,10 @@ use xodus::tokens::TokenManager;
 mod commands;
 mod license;
 mod package;
+#[cfg(feature = "native-webview")]
+mod webview;
+#[cfg(not(feature = "native-webview"))]
+#[path = "webview_stdio.rs"]
 mod webview;
 
 #[derive(Subcommand)]
@@ -150,6 +154,9 @@ enum ClepAction {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct CliArgs {
+    #[cfg(not(feature = "native-webview"))]
+    #[arg(long, help = "Use Nexus external sign-in UI protocol version 1 on private stdio")]
+    external_webview_stdio: bool,
     #[command(subcommand)]
     command: SubCommand,
 }
@@ -181,6 +188,10 @@ async fn main() -> ExitCode {
         .build()
         .unwrap();
     let args = CliArgs::parse();
+    #[cfg(not(feature = "native-webview"))]
+    if args.external_webview_stdio {
+        webview::enable_stdio();
+    }
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
