@@ -90,6 +90,41 @@ pub fn store_ticket(ticket: String) -> String {
     }
 }
 
+/// Format a user ticket only when it is sent to content licensing. Compact JWE
+/// tickets use their bare representation, unlike opaque delegation tickets.
+/// Keep Token conversion (Xbox) and store_ticket (Store) unchanged.
+pub fn licensing_ticket(ticket: String) -> String {
+    let bare = ticket.strip_prefix("d=").or_else(|| ticket.strip_prefix("t=")).unwrap_or(&ticket);
+    if is_compact_jwe(bare) { bare.to_string() } else { store_ticket(ticket) }
+}
+
+// This recognizes wire encoding, not authenticity or entitlement. Microsoft
+// still validates the entire ticket. Never decrypt, log or rewrite its payload.
+fn is_compact_jwe(value: &str) -> bool {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let mut segments = value.split('.');
+    let Some(header) = segments.next() else { return false; };
+    if header.is_empty() || header.len() > 8192 { return false; }
+    let Some(key) = segments.next() else { return false; };
+    let Some(iv) = segments.next() else { return false; };
+    let Some(ciphertext) = segments.next() else { return false; };
+    let Some(tag) = segments.next() else { return false; };
+    // The encrypted key may be empty with direct key agreement/encryption.
+    if segments.next().is_some() || iv.is_empty() || ciphertext.is_empty() || tag.is_empty() {
+        return false;
+    }
+    if ![header, key, iv, ciphertext, tag].iter().all(|part| {
+        part.len() % 4 != 1 && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }) { return false; }
+    let Ok(header) = URL_SAFE_NO_PAD.decode(header) else { return false; };
+    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else { return false; };
+    ["alg", "enc"].iter().all(|key| header.get(key).and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()))
+}
+
+#[cfg(test)]
+#[path = "licensing_ticket_tests.rs"]
+mod licensing_ticket_tests;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenStore {
     #[serde(flatten)]

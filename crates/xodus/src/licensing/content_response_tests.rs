@@ -13,6 +13,25 @@ fn success() -> serde_json::Value {
 }
 
 #[test]
+fn content_ticket_content_request_preserves_jwe_and_other_license_fields() {
+    let raw = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..aXY.Y2lwaGVy_dGV4dA.dGFn";
+    for (input, expected) in [(format!("d={raw}"), raw), ("d=opaque".into(), "t=opaque"),
+        ("t=compact&p=proof".into(), "t=compact&p=proof")] {
+        let request = super::super::content_request(&reqwest::Client::new(), "device-unchanged".into(),
+            crate::models::secrets::licensing_ticket(input), "reference-unchanged".into(),
+            "11111111-1111-4111-8111-111111111111".into(), "US".into()).build().unwrap();
+        assert_eq!(request.headers()["authorization"], "device-unchanged");
+        let body: serde_json::Value = serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["market"], "US"); assert_eq!(body["licenseVersion"], 4);
+        assert_eq!(body["contentId"], "11111111-1111-4111-8111-111111111111");
+        let user = &body["users"].as_object().unwrap().values().next().unwrap()[0];
+        assert_eq!(user["identityValue"], expected);
+        assert_eq!(user["localTicketReference"], "reference-unchanged");
+        assert_eq!(user["identityType"], "Msa");
+    }
+}
+
+#[test]
 fn content_license_request_contract_is_unchanged() {
     let request = super::super::content_request(
         &reqwest::Client::new(),

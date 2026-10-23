@@ -77,7 +77,7 @@ async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Re
     };
     if !user_ticket_type(&response.token_type) { return Err(FAIL) }
     let Token::Compact(user_token) = Token::try_from(response).map_err(|_| FAIL)? else { return Err(FAIL) };
-    let user_token = xodus::models::secrets::store_ticket(user_token);
+    let user_token = xodus::models::secrets::licensing_ticket(user_token);
     let mut response = context.client.post("https://licensing.mp.microsoft.com/v8.0/licenseToken")
         .timeout(Duration::from_secs(60)).header("from", "XboxLicenseManager")
         .header("Authorization", device_token).header("User-Agent", "XboxGameRuntime")
@@ -113,6 +113,25 @@ mod tests {
         assert!(!user_ticket_type("urn:passport:legacy"));
         assert_eq!(xodus::models::secrets::store_ticket("d=abc".into()), "t=abc");
         assert_eq!(xodus::models::secrets::store_ticket("t=abc&p=".into()), "t=abc&p=");
+    }
+
+    #[test]
+    fn store_license_jwe_keeps_existing_request_and_opaque_ticket_behavior() {
+        let raw = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..aXY.Y2lwaGVy_dGV4dA.dGFn";
+        for (input, expected) in [(format!("d={raw}"), raw), ("d=opaque".into(), "t=opaque"),
+            ("t=compact&p=proof".into(), "t=compact&p=proof")] {
+            let value = license_request(request(&["9N4PT8HGCDHQ/0010"]), vec![LicenseUserIdentity {
+                identity_type: "Msa".into(), identity_value: xodus::models::secrets::licensing_ticket(input),
+                local_ticket_reference: "reference-unchanged".into(),
+            }]);
+            let value = serde_json::to_value(value).unwrap();
+            assert_eq!(value["beneficiaries"][0]["identityValue"], expected);
+            assert_eq!(value["beneficiaries"][0]["localTicketReference"], "reference-unchanged");
+            assert_eq!(value["parentProductId"], "9N4PT8HGCDHQ");
+            assert_eq!(value["relatedProductIds"], serde_json::json!(["9N4PT8HGCDHQ/0010"]));
+            assert_eq!(value["enforceSellableBy"], true);
+            assert_eq!(value["customDeveloperString"], "nonce<&>");
+        }
     }
 
     fn request(ids: &[&str]) -> StoreLicenseTokenRequest {
