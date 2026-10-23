@@ -72,8 +72,11 @@ impl TokenManager {
     }
 
     pub fn save_device_license(&self, device: &Device) -> Result<(), TokenStoreError> {
-        self.persistent
-            .set(keys::DEV_LICENSE, &serde_json::to_vec(device)?)
+        Self::write_verified(
+            &*self.persistent,
+            keys::DEV_LICENSE,
+            &serde_json::to_vec(device)?,
+        )
     }
 
     pub fn remove_device_license(&self) -> Result<(), TokenStoreError> {
@@ -121,8 +124,11 @@ impl TokenManager {
     }
 
     pub fn save_user(&self, user: &User) -> Result<(), TokenStoreError> {
-        self.persistent
-            .set(keys::USER_INFO, &serde_json::to_vec(user)?)
+        Self::write_verified(
+            &*self.persistent,
+            keys::USER_INFO,
+            &serde_json::to_vec(user)?,
+        )
     }
 
     // ---- Ephemeral XSTS-by-relying-party cache --------------------------------
@@ -150,6 +156,18 @@ impl TokenManager {
 
     // ---- shared TokenStore read/modify/write helper ---------------------------
 
+    fn write_verified(
+        backend: &dyn TokenBackend,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<(), TokenStoreError> {
+        backend.set(key, bytes)?;
+        match backend.get(key)? {
+            Some(saved) if saved == bytes => Ok(()),
+            _ => Err(TokenStoreError::WriteVerification),
+        }
+    }
+
     fn read_token_store(
         backend: &dyn TokenBackend,
         key: &str,
@@ -170,11 +188,17 @@ impl TokenManager {
     ) -> Result<(), TokenStoreError> {
         let mut tokens: HashMap<String, Token> = match backend.get(key)? {
             Some(bytes) if !bytes.is_empty() => {
-                serde_json::from_slice::<TokenStore>(&bytes)?.tokens
+                match serde_json::from_slice::<TokenStore>(&bytes) {
+                    Ok(store) => store.tokens,
+                    // Only a freshly authenticated device token may replace its
+                    // damaged cache. Never discard device identity or user tokens.
+                    Err(_) if key == keys::DEVICE_TOKENS => HashMap::new(),
+                    Err(error) => return Err(error.into()),
+                }
             }
             _ => HashMap::new(),
         };
         tokens.insert(address, token);
-        backend.set(key, &serde_json::to_vec(&TokenStore { tokens })?)
+        Self::write_verified(backend, key, &serde_json::to_vec(&TokenStore { tokens })?)
     }
 }

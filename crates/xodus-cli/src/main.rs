@@ -211,7 +211,10 @@ async fn main() -> ExitCode {
             Err(error) => { eprintln!("{error}"); ExitCode::FAILURE },
         };
     }
-    xodus::secrets::init_secrets().expect("Unable to initialize credentials");
+    if let Err(error) = xodus::secrets::init_secrets() {
+        xodus::tokens::store::TokenStoreError::from(error).report();
+        return ExitCode::FAILURE;
+    }
     let tokens = TokenManager::with_keychain_and_memory();
 
     // Clep/SpLicense are pure local data transforms and Logout only removes
@@ -230,7 +233,10 @@ async fn main() -> ExitCode {
             | SubCommand::Logout { .. }
     );
     if needs_device_credentials {
-        xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
+        if let Err(error) = xodus::tokens::device::ensure_device_credentials(&client, &tokens).await {
+            error.report();
+            return ExitCode::FAILURE;
+        }
     }
 
     let code = match args.command {

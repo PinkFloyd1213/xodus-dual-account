@@ -10,12 +10,16 @@ pub async fn get_license(
     content_id: String,
     market: String,
 ) -> std::result::Result<(DeviceKey, SPLicense), String> {
-    let dev_token = tokens.get_device_sts_token().unwrap();
+    let dev_token = tokens
+        .get_device_sts_token()
+        .map_err(|error| error.to_string())?;
     let Token::Legacy(dev_token) = dev_token else {
         return Err("Invalid STS token".to_string());
     };
-    let user = tokens.get_user().unwrap();
-    let user_token = tokens.get_user_sts_token().unwrap();
+    let user = tokens.get_user().map_err(|error| error.to_string())?;
+    let user_token = tokens
+        .get_user_sts_token()
+        .map_err(|error| error.to_string())?;
     let Token::Legacy(legacy) = user_token else {
         return Err("Unspported user token".to_string());
     };
