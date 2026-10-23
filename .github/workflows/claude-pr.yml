@@ -1,0 +1,103 @@
+# Claude reviews every same-repo PR into dual-account (notably the Nexus
+# recipe syncs), fixes what is broken and pushes to the PR branch. Never merges.
+name: Claude PR check
+
+on:
+  pull_request:
+    branches: [dual-account]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+
+concurrency:
+  group: claude-pr-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Fork PRs get no secrets; Claude's own pushes must not re-run it.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'claude[bot]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Resolve the PR branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head=$(gh pr view "$NUMBER" -R "$GITHUB_REPOSITORY" --json headRefName --jq .headRefName)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - name: Install build tools
+        # A stalled Ubuntu mirror must not hold the job: bounded retries.
+        timeout-minutes: 8
+        run: |
+          for attempt in 1 2 3; do
+            timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update \
+              && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
+              && exit 0
+            echo "apt attempt $attempt failed, retrying"; sleep 10
+          done
+          exit 1
+
+      - name: Claude is not configured yet
+        if: env.HAS_CLAUDE_TOKEN != 'true'
+        run: echo "::notice::Add the CLAUDE_CODE_OAUTH_TOKEN secret to enable the Claude review."
+      - uses: anthropics/claude-code-action@v1
+        if: env.HAS_CLAUDE_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Progress comments exist only for PR events, not for a dispatched run.
+          track_progress: ${{ github.event_name == 'pull_request' }}
+          prompt: |
+            You maintain the "dual-account" fork of Xodus used by Xodus Nexus. Read docs/dual-account.md first:
+            the store account owns licenses/entitlements/downloads, the play account is the in-game identity
+            (MsaTokenRequest, PlayFab), device credentials are shared, and with no play account everything must
+            behave exactly like upstream.
+            Pull request #${{ steps.pr.outputs.number }}: branch ${{ steps.pr.outputs.head }} into dual-account.
+
+            1. If the branch does not merge cleanly into dual-account, run `git merge origin/dual-account` here and
+               resolve the conflicts, keeping both the dual-account changes and the incoming ones. Always merge,
+               never rebase: nexus-base must stay an ancestor of dual-account.
+            2. For a Nexus recipe sync (head nexus-sync), look at what the new upstream patches change
+               (`git diff origin/dual-account...HEAD -- crates`). Any new use of the user account (TokenManager
+               get_user / get_user_sts_token / save_user_token / remove_persistent, session::prepare, xbox_session,
+               store_session) must be routed per docs/dual-account.md: store for licensing, catalog, library,
+               downloads, updates and Store tickets; play (TokenManager::resolve(AccountRole::Play)) for in-game
+               identity. Explain each decision. Update docs/dual-account.md if the map changes.
+            3. Build and test:
+               `cargo build --locked --release --no-default-features -p xodus-cli -p xodus-service`,
+               `cargo test --locked --no-default-features -p xodus-cli`,
+               `cargo test --locked --no-default-features -p xodus credential_`,
+               `cargo test --locked -p xodus-service store_`. Fix real failures; do not weaken tests.
+            4. Commit with clear messages and push with `git push origin HEAD`. Never merge the PR, never
+               force-push, never touch secrets, never print tokens or account data.
+            Finish with a short summary in French for the owner: what changed in the recipe, what you fixed,
+            routing decisions, what is left for a human, and whether it looks safe to merge (with a merge
+            commit, not squash). After the merge, the patch is exported to the Nexus fork automatically.
+            ${{ github.event_name == 'workflow_dispatch' && format('This run was started by hand: write the summary to /tmp/claude-summary.md and post it with `gh pr comment {0} --body-file /tmp/claude-summary.md`.', steps.pr.outputs.number) || '' }}
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(ls *),Bash(gh pr comment ${{ steps.pr.outputs.number }} --body-file /tmp/claude-summary.md)"

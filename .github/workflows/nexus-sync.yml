@@ -1,0 +1,57 @@
+# Daily: follow the backend recipe of domsvoboda/xodus-nexus (pinned Xodus
+# commit + patches). A change becomes one commit on nexus-base and a PR from
+# nexus-sync into dual-account, reviewed by Claude. Never merges.
+name: Nexus recipe sync
+
+on:
+  schedule:
+    - cron: '27 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nexus-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dual-account
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Rebuild nexus-base from upstream Nexus' recipe
+        id: base
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/xodus-gaming/xodus.git
+          git branch nexus-base origin/nexus-base
+          git clone -q --depth 1 https://github.com/domsvoboda/xodus-nexus.git "$RUNNER_TEMP/nexus"
+          result=$(scripts/nexus-base-update.sh "$RUNNER_TEMP/nexus" | tail -1)
+          echo "$result"
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+      - name: Push nexus-base and open the PR
+        if: startsWith(steps.base.outputs.result, 'updated')
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          RESULT: ${{ steps.base.outputs.result }}
+        run: |
+          set -euo pipefail
+          git push origin nexus-base
+          pr=$(gh pr list --head nexus-sync --base dual-account --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            echo "PR #$pr is still open; merge nexus-base into nexus-sync to pick up this recipe too."
+            exit 0
+          fi
+          # Fixes (by Claude or by hand) go to nexus-sync; nexus-base stays the pure recipe.
+          git push --force origin nexus-base:refs/heads/nexus-sync
+          gh pr create --head nexus-sync --base dual-account \
+            --title "Sync Nexus backend recipe (${RESULT#updated })" \
+            --body "Upstream Xodus Nexus changed its backend recipe. nexus-base now holds it as one commit. Merge with a merge commit (not squash): after the merge, the dual-account patch is exported to the Nexus fork automatically. Checks and the Claude review run on this PR."

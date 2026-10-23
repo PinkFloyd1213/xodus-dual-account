@@ -1,0 +1,82 @@
+# After dual-account changes, send the regenerated xodus-dual-account.patch to
+# the Nexus fork: onto its open upstream-sync PR, or as a new PR.
+name: Export patch to Nexus
+
+on:
+  push:
+    branches: [dual-account]
+    paths: ['crates/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-export
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dual-account
+          fetch-depth: 0
+      - name: Generate the patch
+        run: |
+          git branch nexus-base origin/nexus-base
+          scripts/dual-account-patch.sh "$RUNNER_TEMP/xodus-dual-account.patch"
+      - name: Update the Nexus fork
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          NEXUS: PinkFloyd1213/xodus-nexus-dual-account
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "::error::The SYNC_TOKEN secret is required to update the Nexus fork."; exit 1; }
+          sync=$(gh pr list -R "$NEXUS" --head upstream-sync --base dual-account --state open --json number --jq '.[0].number // empty')
+          target=${sync:+upstream-sync}
+          target=${target:-dual-account}
+          git clone -q --branch "$target" "https://x-access-token:${GH_TOKEN}@github.com/${NEXUS}.git" "$RUNNER_TEMP/nexus"
+          cd "$RUNNER_TEMP/nexus"
+          if cmp -s "$RUNNER_TEMP/xodus-dual-account.patch" assets/xodus-dual-account.patch; then
+            echo "The Nexus fork already has this patch."
+            exit 0
+          fi
+          cp "$RUNNER_TEMP/xodus-dual-account.patch" assets/xodus-dual-account.patch
+          patch_id=$(python3 -I - <<'PY'
+          import hashlib, json, pathlib, re
+          path = pathlib.Path("assets/backend-source.lock.json")
+          lock = json.loads(path.read_text())
+          sha = hashlib.sha256(pathlib.Path("assets/xodus-dual-account.patch").read_bytes()).hexdigest()
+          lock["patches"] = [p for p in lock["patches"] if p["file"] != "xodus-dual-account.patch"]
+          lock["patches"].append({"file": "xodus-dual-account.patch", "sha256": sha})
+          match = re.fullmatch(r"(.*?)-dual-account-(\d+)", lock["patchId"])
+          base, n = (match.group(1), int(match.group(2))) if match else (lock["patchId"], 0)
+          lock["patchId"] = f"{base}-dual-account-{n + 1}"
+          lock["repository"] = "https://github.com/PinkFloyd1213/xodus-dual-account.git"
+          # Same layout as the Nexus lock: one key per line, one patch per line.
+          lines = ["{"] + [f"  {json.dumps(k)}: {json.dumps(v)}," for k, v in lock.items() if k != "patches"]
+          lines.append('  "patches": [')
+          lines += [f'    {{ "file": {json.dumps(p["file"])}, "sha256": {json.dumps(p["sha256"])} }}' + ("," if i < len(lock["patches"]) - 1 else "")
+                    for i, p in enumerate(lock["patches"])]
+          lines += ["  ]", "}"]
+          path.write_text("\n".join(lines) + "\n")
+          print(lock["patchId"])
+          PY
+          )
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          message="backend: dual-account patch from xodus-dual-account@${GITHUB_SHA::7} ($patch_id)"
+          if [ -n "$sync" ]; then
+            git commit -qam "$message"
+            git push -q origin HEAD:upstream-sync
+            gh pr comment "$sync" -R "$NEXUS" --body "Backend patch updated from PinkFloyd1213/xodus-dual-account@${GITHUB_SHA} (\`$patch_id\`)."
+          else
+            branch="backend-patch-${GITHUB_SHA::7}"
+            git switch -q -c "$branch"
+            git commit -qam "$message"
+            git push -q origin "$branch"
+            gh pr create -R "$NEXUS" --head "$branch" --base dual-account --title "$message" \
+              --body "Regenerated from PinkFloyd1213/xodus-dual-account@${GITHUB_SHA}. Merging it publishes a launcher release; then use \"Update dual-account backend\" in Settings."
+          fi
