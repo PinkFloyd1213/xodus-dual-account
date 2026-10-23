@@ -12,10 +12,6 @@ on:
         description: Pull request number
         required: true
 
-concurrency:
-  group: claude-pr-${{ github.event.pull_request.number || inputs.pr }}
-  cancel-in-progress: true
-
 jobs:
   review:
     # Fork PRs get no secrets; Claude's own pushes must not re-run it.
@@ -23,6 +19,10 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'claude[bot]')
     runs-on: ubuntu-24.04
+    # Job level: Claude's own push starts a skipped run, which must not cancel this one.
+    concurrency:
+      group: claude-pr-${{ github.event.pull_request.number || inputs.pr }}
+      cancel-in-progress: true
     timeout-minutes: 90
     env:
       HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
