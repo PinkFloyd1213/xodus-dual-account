@@ -33,6 +33,33 @@ struct Job {
     content: SegmentFile,
 }
 
+fn pending_files<'a>(
+    root: &Path,
+    remote: &'a HashMap<String, SegmentFile>,
+    local: &HashMap<String, SegmentFile>,
+) -> std::io::Result<Vec<(&'a String, &'a SegmentFile)>> {
+    let mut pending = Vec::new();
+    for (name, file) in remote {
+        let unchanged = local.get(name).is_some_and(|old| {
+            !file.data_hashs.is_empty() && file.data_hashs == old.data_hashs
+                && file.length == old.length && file.keep_encrypted == old.keep_encrypted
+        });
+        let needs_repair = if unchanged && file.keep_encrypted {
+            // Matching package metadata alone does not prove that the on-disk
+            // ciphertext still includes the full final page.
+            let target = resume::target(root, name)?;
+            match std::fs::metadata(target) {
+                Ok(metadata) if metadata.is_file() => metadata.len() < file.stored_length()?,
+                Ok(_) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "package image is not a regular file")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error),
+            }
+        } else { false };
+        if !unchanged || needs_repair { pending.push((name, file)); }
+    }
+    Ok(pending)
+}
+
 enum ProgressEvent {
     Started { id: usize, name: String, total: u64 },
     Advanced { id: usize, delta: u64 },
@@ -420,15 +447,12 @@ where
         Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
     };
 
-    let total_size: u64 = rfiles
+    let pending = match pending_files(out, &rfiles, &lfiles) {
+        Ok(files) => files,
+        Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
+    };
+    let total_size: u64 = pending
         .iter()
-        .filter(|(k, v1)| {
-            if let Some(v2) = lfiles.get(*k) {
-                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-            } else {
-                true
-            }
-        })
         .map(|(_, v)| v.length)
         .sum();
 
@@ -439,13 +463,8 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let saved: u64 = rfiles
+    let saved: u64 = pending
         .iter()
-        .filter(|(name, remote)| {
-            lfiles.get(*name).is_none_or(|local| {
-                remote.data_hashs != local.data_hashs || remote.data_hashs.is_empty()
-            })
-        })
         .map(|(name, file)| journal.lock().unwrap().offset(name, file.length))
         .sum();
     let required_free_space = total_size.saturating_sub(saved);
@@ -482,15 +501,8 @@ where
     let remote_xvd_ref = &remote_xvd;
     let (failed, failure_signal) = tokio::sync::watch::channel(false);
     stream::iter(
-        rfiles
-            .iter()
-            .filter(|(k, v1)| {
-                if let Some(v2) = lfiles.get(*k) {
-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-                } else {
-                    true
-                }
-            })
+        pending
+            .into_iter()
             .map(|(n, v)| Job {
                 name: n.clone(),
                 content: SegmentFile {
@@ -533,7 +545,7 @@ where
             if url.starts_with("file://") && offset != job.content.length {
                 offset = 0;
             }
-            resume::prepare_output(&mut fout, offset).await?;
+            offset = resume::prepare_output(&mut fout, offset, &job.content).await?;
             let mut lp = offset;
 
             let progress = |pos, _| {

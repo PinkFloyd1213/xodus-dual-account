@@ -14,12 +14,57 @@ pub(super) struct Journal {
     entries: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Trim stale tails even when the complete new file has zero bytes.
-pub(super) async fn prepare_output(file: &mut tokio::fs::File, offset: u64) -> io::Result<()> {
+/// Preserve completed ciphertext pages, trim only uncommitted data. Return the
+/// logical offset to resume from, which can rewind an old truncated final page.
+pub(super) async fn prepare_output(
+    file: &mut tokio::fs::File,
+    mut offset: u64,
+    content: &SegmentFile,
+) -> io::Result<u64> {
     use tokio::io::AsyncSeekExt;
-    file.set_len(offset).await?;
-    file.seek(SeekFrom::Start(offset)).await?;
-    Ok(())
+    let stored_length = content.stored_length()?;
+    let page_size = msixvc::layout::PAGE_SIZE as u64;
+    if offset > content.length || (offset != content.length && offset % page_size != 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid download checkpoint offset"));
+    }
+    let actual = file.metadata().await?.len();
+    if actual < offset {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "checkpoint file changed during download preparation"));
+    }
+    let physical = if offset == content.length && content.keep_encrypted {
+        if actual >= stored_length {
+            stored_length
+        } else {
+            // Older resumes trimmed off required ciphertext. Fetch the final
+            // full page again; extending with zeroes would corrupt decryption.
+            offset = content.length / page_size * page_size;
+            offset
+        }
+    } else {
+        offset
+    };
+    file.set_len(physical).await?;
+    file.seek(SeekFrom::Start(physical)).await?;
+    Ok(offset)
+}
+
+#[tokio::test]
+async fn streaming_resume_completed_encrypted_image_preserves_ciphertext_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("game.exe");
+    let bytes: Vec<u8> = (0..8192).map(|n| (n % 251) as u8).collect();
+    fs::write(&path, &bytes).unwrap();
+    let layout = HashMap::from([("game.exe".to_owned(), SegmentFile {
+        offset: 0, length: 5000, keep_encrypted: true, data_hashs: vec![],
+    })]);
+    let mut journal = Journal::open(root.path(), "synthetic-package", &layout).unwrap();
+    journal.checkpoint("game.exe", 5000).unwrap();
+    let logical = journal.offset("game.exe", 5000);
+    assert_eq!(logical, 5000);
+    let mut output = tokio::fs::OpenOptions::new().write(true).open(&path).await.unwrap();
+    assert_eq!(prepare_output(&mut output, logical, &layout["game.exe"]).await.unwrap(), logical);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 8192, "completed encrypted files need the full final ciphertext page");
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 
 #[tokio::test]
@@ -33,11 +78,102 @@ async fn streaming_updated_file_is_trimmed_even_when_its_expected_length_is_zero
             .open(&path)
             .await
             .unwrap();
-        prepare_output(&mut file, offset).await.unwrap();
+        let content = SegmentFile { offset: 0, length: offset, keep_encrypted: false, data_hashs: vec![] };
+        assert_eq!(prepare_output(&mut file, offset, &content).await.unwrap(), offset);
         assert_eq!(
             std::fs::read(path).unwrap(),
             &b"old-content"[..offset as usize]
         );
+    }
+}
+
+#[tokio::test]
+async fn streaming_resume_ciphertext_layout_preserves_only_committed_pages_and_never_zero_fills() {
+    use tokio::io::AsyncSeekExt;
+    for (length, actual, checkpoint, encrypted, expected_offset, expected_len) in [
+        (1, 4096, 1, true, 1, 4096),
+        (4095, 4096, 4095, true, 4095, 4096),
+        (4096, 4096, 4096, true, 4096, 4096),
+        (4097, 8192, 4097, true, 4097, 8192),
+        (5000, 9000, 5000, true, 5000, 8192),
+        (5000, 5000, 5000, true, 4096, 4096),
+        (5000, 7000, 5000, true, 4096, 4096),
+        (1, 1, 1, true, 0, 0),
+        (5000, 8192, 4096, true, 4096, 4096),
+        (5000, 8192, 0, true, 0, 0),
+        (5000, 8192, 5000, false, 5000, 5000),
+        (0, 8192, 0, true, 0, 0),
+        (0, 8192, 0, false, 0, 0),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture");
+        let bytes: Vec<u8> = (0..actual).map(|n| (n % 251) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let content = SegmentFile { offset: 0, length, keep_encrypted: encrypted, data_hashs: vec![] };
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(&path).await.unwrap();
+        assert_eq!(prepare_output(&mut file, checkpoint, &content).await.unwrap(), expected_offset);
+        assert_eq!(file.stream_position().await.unwrap(), expected_len);
+        assert_eq!(fs::read(&path).unwrap(), bytes[..expected_len as usize]);
+    }
+}
+
+#[tokio::test]
+async fn streaming_resume_invalid_or_changed_checkpoint_does_not_modify_files() {
+    for (length, offset, encrypted) in [(5000, 1, true), (5000, 9000, true), (u64::MAX, 0, true), (5000, 4096, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture");
+        let original = b"unchanged";
+        fs::write(&path, original).unwrap();
+        let content = SegmentFile { offset: 0, length, keep_encrypted: encrypted, data_hashs: vec![] };
+        let mut file = tokio::fs::OpenOptions::new().write(true).open(&path).await.unwrap();
+        assert!(prepare_output(&mut file, offset, &content).await.is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+}
+
+#[tokio::test]
+async fn streaming_resume_repairs_old_encrypted_tail_with_actual_range_download() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for length in [1u64, 4097, 5000, 8193] {
+        let content = SegmentFile { offset: 0, length, keep_encrypted: true, data_hashs: vec![] };
+        let stored = content.stored_length().unwrap();
+        let ciphertext: Vec<u8> = (0..stored).map(|n| (n % 251) as u8).collect();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.exe");
+        fs::write(&path, &ciphertext[..length as usize]).unwrap();
+        let files = HashMap::from([("fixture.exe".to_owned(), content)]);
+        let mut journal = Journal::open(root.path(), "synthetic", &files).unwrap();
+        journal.checkpoint("fixture.exe", length).unwrap();
+        let mut out = tokio::fs::OpenOptions::new().write(true).open(&path).await.unwrap();
+        let offset = prepare_output(&mut out, journal.offset("fixture.exe", length), &files["fixture.exe"]).await.unwrap();
+        assert_eq!(offset, length / 4096 * 4096);
+        journal.checkpoint("fixture.exe", offset).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = ciphertext.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); assert!(request.len() < 8192); }
+            assert!(String::from_utf8(request).unwrap().to_ascii_lowercase().contains(&format!("range: bytes={offset}-{}\r\n", stored - 1)));
+            socket.write_all(format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {offset}-{}/{stored}\r\nConnection: close\r\n\r\n", stored-offset, stored-1).as_bytes()).await.unwrap();
+            socket.write_all(&body[offset as usize..]).await.unwrap();
+        });
+        let mut header = vec![0; 4096];
+        header[512..520].copy_from_slice(b"msft-xvd");
+        header[528..536].copy_from_slice(&116444736000000000u64.to_le_bytes());
+        header[652..656].copy_from_slice(&4u32.to_le_bytes());
+        let xvd = msixvc::xvd::XvdFile::parse(std::io::Cursor::new(header)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), xvd.download_file_http(
+            &reqwest::Client::new(), &format!("http://{address}/synthetic"), &mut out,
+            &files["fixture.exe"], [0;32], |_,_| {}, None, offset,
+            |pos| journal.checkpoint("fixture.exe", pos),
+        )).await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), ciphertext);
+        assert_eq!(journal.offset("fixture.exe", length), length);
+        assert_eq!(prepare_output(&mut out, length, &files["fixture.exe"]).await.unwrap(), length);
+        assert_eq!(fs::read(&path).unwrap(), ciphertext);
     }
 }
 
