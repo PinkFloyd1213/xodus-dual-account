@@ -7,6 +7,10 @@ const MAX_PRODUCTS: usize = 48;
 const MAX_DEPTH: usize = 6;
 const MAX_CHOICES: usize = 128;
 
+#[cfg(test)]
+#[path = "package_plan_http_tests.rs"]
+mod http_tests;
+
 #[derive(Clone, Debug)]
 pub struct Choice {
     pub product_id: String,
@@ -29,8 +33,8 @@ fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value[key].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
 
-// Bundle membership takes precedence over licensing keys, which often contain
-// the offer itself and subscription plans rather than installable children.
+// Only explicit bundle membership describes downloadable children. Licensing
+// keys name offers that grant this product, not products contained in it.
 fn inspect(product: &Value, id: &str) -> Result<(Vec<Choice>, Vec<String>), String> {
     if product["ProductId"].as_str() != Some(id) { return Err("Store product identity mismatch".into()); }
     let localized = list(product, "LocalizedProperties").first().unwrap_or(&Value::Null);
@@ -39,7 +43,6 @@ fn inspect(product: &Value, id: &str) -> Result<(Vec<Choice>, Vec<String>), Stri
     let kind = text(product, "ProductType");
     let mut choices: BTreeMap<(String, String, String), Choice> = BTreeMap::new();
     let mut bundled = HashSet::new();
-    let mut licensed = HashSet::new();
     for availability in list(product, "DisplaySkuAvailabilities") {
         let properties = &availability["Sku"]["Properties"];
         for package in list(properties, "Packages") {
@@ -66,23 +69,11 @@ fn inspect(product: &Value, id: &str) -> Result<(Vec<Choice>, Vec<String>), Stri
         for reference in list(properties, "BundledSkus") {
             if let Some(child) = reference["BigId"].as_str().filter(|v| product_id(v)) { bundled.insert(child.to_string()); }
         }
-        for offer in list(availability, "Availabilities") {
-            for satisfying in list(&offer["LicensingData"], "SatisfyingEntitlementKeys") {
-                for key in list(satisfying, "EntitlementKeys") {
-                    let parts: Vec<_> = key.as_str().unwrap_or("").split(':').collect();
-                    if parts.len() == 3 && parts[0] == "big" && product_id(parts[1])
-                        && parts[1] != id && !parts[1].starts_with("CFQ") { licensed.insert(parts[1].to_string()); }
-                }
-            }
-        }
     }
     if choices.len() > MAX_CHOICES { return Err("Too many Store packages".into()); }
     // Direct packages define this product. Do not follow unrelated licensing keys.
     let has_desktop = choices.values().any(|c| c.platform == "Windows.Desktop");
-    let mut children: Vec<_> = if has_desktop { vec![] }
-        else if !bundled.is_empty() { bundled.into_iter().collect() }
-        else if kind == "Game" || kind == "GameAddOn" { licensed.into_iter().collect() }
-        else { vec![] };
+    let mut children: Vec<_> = if has_desktop { vec![] } else { bundled.into_iter().collect() };
     children.sort();
     if children.len() > MAX_PRODUCTS { return Err("Store bundle contains too many products".into()); }
     Ok((choices.into_values().collect(), children))
@@ -92,7 +83,7 @@ pub fn from_products(root: &str, products: &BTreeMap<String, Value>) -> Result<P
     fn walk(id: &str, products: &BTreeMap<String, Value>, path: &mut HashSet<String>, seen: &mut HashSet<String>, choices: &mut BTreeMap<String, Choice>, depth: usize) -> Result<(), String> {
         if depth > MAX_DEPTH || path.contains(id) { return Err("Circular or excessively deep Store bundle".into()); }
         if seen.contains(id) { return Ok(()) }
-        if seen.len() >= MAX_PRODUCTS { return Err("Store bundle contains too many products".into()); }
+        if seen.len() + path.len() >= MAX_PRODUCTS { return Err("Store bundle contains too many products".into()); }
         path.insert(id.to_string());
         let product = products.get(id).ok_or("Incomplete Store bundle metadata")?;
         let (direct, children) = inspect(product, id)?;
@@ -133,6 +124,12 @@ impl Plan {
 }
 
 pub async fn resolve(client: &reqwest::Client, root: &str, market: &str) -> Result<Plan, String> {
+    resolve_from(client, root, market, "https://displaycatalog.mp.microsoft.com/v7.0/products").await
+}
+
+// The production endpoint is fixed above. A private parameter permits local
+// HTTP regression fixtures without accounts, licensing or external requests.
+async fn resolve_from(client: &reqwest::Client, root: &str, market: &str, catalog: &str) -> Result<Plan, String> {
     if !product_id(root) || !(market.len() == 2 && market.bytes().all(|c| c.is_ascii_uppercase())) {
         return Err("Invalid Store product or market".into());
     }
@@ -142,9 +139,12 @@ pub async fn resolve(client: &reqwest::Client, root: &str, market: &str) -> Resu
         while let Some((id, depth)) = pending.pop() {
             if products.contains_key(&id) { continue }
             if depth > MAX_DEPTH || products.len() >= MAX_PRODUCTS { return Err("Store bundle exceeds resolver limits".into()); }
-            let response = client.get(format!("https://displaycatalog.mp.microsoft.com/v7.0/products/{id}?market={market}&languages=en,neutral"))
-                .timeout(std::time::Duration::from_secs(10)).send().await.map_err(|_| "Store metadata request failed")?
-                .error_for_status().map_err(|_| "Store metadata is unavailable for this market")?;
+            let response = client.get(format!("{catalog}/{id}?market={market}&languages=en,neutral"))
+                .timeout(std::time::Duration::from_secs(10)).send().await
+                .map_err(|_| format!("Store metadata request failed for product {id} (market {market})"))?;
+            if !response.status().is_success() {
+                return Err(format!("Store metadata returned HTTP {} for product {id} (market {market})", response.status().as_u16()));
+            }
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| "Store metadata read failed")? {
@@ -241,5 +241,49 @@ mod tests {
         root["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["BundledSkus"] = json!([{"BigId":CHILD}]);
         let plan = from_products(ROOT,&BTreeMap::from([(ROOT.into(),root),(CHILD.into(),package(CHILD,"Windows.Desktop","MSIXVC"))])).unwrap();
         assert_eq!(plan.choices.len(),2); assert!(plan.select(None).is_ok());
+    }
+
+    fn license_only_addon(id: &str, offers: &[&str]) -> Value {
+        json!({"ProductId":id,"ProductType":"GameAddOn",
+            "DisplaySkuAvailabilities":[{"Sku":{"Properties":{}},"Availabilities":[{
+                "LicensingData":{"SatisfyingEntitlementKeys":[{"EntitlementKeys":offers.iter()
+                    .map(|offer| format!("big:{offer}:0010")).collect::<Vec<_>>()}]}
+            }]}]})
+    }
+
+    #[test] fn premium_entitlement_links_do_not_walk_back_to_parent_or_foreign_games() {
+        let addon = "9CCCCCCCCCCC";
+        // A bundle grants its license-only VIP upgrade, not the other way round.
+        // The other offer can be a delisted cross-game bundle (HTTP 404).
+        let plan = from_products(ROOT, &BTreeMap::from([
+            (ROOT.into(), bundle(ROOT, &[CHILD, addon])),
+            (CHILD.into(), package(CHILD, "Windows.Desktop", "MSIXVC")),
+            (addon.into(), license_only_addon(addon, &[ROOT, "9DDDDDDDDDDD"])),
+        ])).unwrap();
+        assert_eq!(plan.choices.len(), 1);
+        assert_eq!(plan.select(None).unwrap(), CID);
+        assert_eq!(plan.choices[0].product_id, CHILD);
+    }
+
+    #[test] fn premium_license_only_addon_never_selects_a_game_that_grants_it() {
+        let plan = from_products(ROOT, &BTreeMap::from([
+            (ROOT.into(), license_only_addon(ROOT, &[CHILD])),
+            (CHILD.into(), package(CHILD, "Windows.Desktop", "MSIXVC")),
+        ])).unwrap();
+        assert!(plan.choices.is_empty());
+        assert!(plan.select(None).is_err());
+        assert!(plan.select(Some(CID)).is_err());
+    }
+
+    #[test] fn premium_game_entitlement_is_not_bundle_membership_either() {
+        let mut offer = license_only_addon(ROOT, &[CHILD]);
+        offer["ProductType"] = json!("Game");
+        let plan = from_products(ROOT, &BTreeMap::from([
+            (ROOT.into(), offer),
+            (CHILD.into(), package(CHILD, "Windows.Desktop", "MSIXVC")),
+        ])).unwrap();
+        assert!(plan.choices.is_empty());
+        assert!(plan.select(None).is_err());
+        assert!(plan.select(Some(CID)).is_err());
     }
 }
