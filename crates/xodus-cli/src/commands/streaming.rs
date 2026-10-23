@@ -301,10 +301,16 @@ where
     let mut rfiles: HashMap<String, SegmentFile> = HashMap::new();
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
-    let files = remote_xvd
+    let files = match remote_xvd
         .parse_user_package_files(&mut remote_file)
         .await
-        .expect("ok");
+    {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!("Cannot read package-file metadata: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
             let sfiles = remote_xvd
@@ -337,7 +343,13 @@ where
     if let Some(mut file) = file {
         let xvd = XvdFile::parse(&mut file).await.expect("no err");
 
-        let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
+        let files = match xvd.parse_user_package_files(&mut file).await {
+            Ok(files) => files,
+            Err(error) => {
+                eprintln!("Cannot read cached package-file metadata: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
         for (k, v) in &files {
             if k == "SegmentMetadata.bin" {
                 let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");

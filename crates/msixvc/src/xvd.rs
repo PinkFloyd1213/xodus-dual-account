@@ -30,6 +30,10 @@ use crate::models::xvd::{
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 
 #[cfg(test)]
+#[path = "package_metadata_tests.rs"]
+mod package_metadata_tests;
+
+#[cfg(test)]
 #[path = "download_resume_tests.rs"]
 mod resume_tests;
 
@@ -489,7 +493,17 @@ impl XvdFile {
     {
         let mut files = HashMap::new();
 
-        let user_data_offset = self.layout.user_data.start.0 as u64;
+        let user_data_offset = self.layout.user_data.start.to_bytes().0;
+        let user_data_length = self.layout.user_data.len.0;
+        let invalid = |message| Error::new(ErrorKind::InvalidData, message);
+        if user_data_length == 0 {
+            return Ok(files);
+        }
+        if user_data_length < XvdUserDataHeader::SIZE as u64 {
+            return Err(invalid("Truncated XVD user-data header").into());
+        }
+        let user_data_end = user_data_offset.checked_add(user_data_length)
+            .ok_or_else(|| invalid("XVD user-data range overflow"))?;
         file.seek(SeekFrom::Start(user_data_offset)).await?;
         let user_data_header = {
             let mut buf = XvdUserDataHeader::buffer();
@@ -497,7 +511,14 @@ impl XvdFile {
             XvdUserDataHeader::from_array(&buf)
         };
         if user_data_header.t == 0 {
-            let mut off = user_data_offset + user_data_header.length as u64;
+            let header_length = user_data_header.length as u64;
+            if header_length < XvdUserDataHeader::SIZE as u64
+                || header_length > user_data_length
+                || user_data_length - header_length < XvdUserDataPackageFilesHeader::SIZE as u64
+            {
+                return Err(invalid("Invalid XVD package-file table range").into());
+            }
+            let mut off = user_data_offset + header_length;
             file.seek(SeekFrom::Start(off)).await?;
             let user_data_package_files_header = {
                 let mut buf = XvdUserDataPackageFilesHeader::buffer();
@@ -505,6 +526,10 @@ impl XvdFile {
                 XvdUserDataPackageFilesHeader::from_array(&buf)
             };
             off += XvdUserDataPackageFilesHeader::SIZE as u64;
+            let count = user_data_package_files_header.file_count as u64;
+            if count > (user_data_end - off) / XvdUserDataPackageFileEntry::SIZE as u64 {
+                return Err(invalid("XVD package-file entries exceed user data").into());
+            }
             let mut buf = XvdUserDataPackageFileEntry::buffer();
             for _ in 0..user_data_package_files_header.file_count {
                 file.seek(SeekFrom::Start(off)).await?;
@@ -518,12 +543,17 @@ impl XvdFile {
                     .iter()
                     .position(|&c| c == 0)
                     .unwrap_or(fullname.len());
-                let pfull_name: String = String::from_utf16(&fullname[..end]).unwrap();
+                let pfull_name = String::from_utf16(&fullname[..end])
+                    .map_err(|_| invalid("Invalid UTF-16 in XVD package-file name"))?;
+                let offset = user_data_offset + XvdUserDataHeader::SIZE as u64 + o as u64;
+                if offset > user_data_end || s as u64 > user_data_end - offset {
+                    return Err(invalid("XVD package-file payload exceeds user data").into());
+                }
 
                 files.insert(
                     pfull_name,
                     UserPackageFile {
-                        offset: user_data_offset + XvdUserDataHeader::SIZE as u64 + o as u64,
+                        offset,
                         length: s as u64,
                     },
                 );
