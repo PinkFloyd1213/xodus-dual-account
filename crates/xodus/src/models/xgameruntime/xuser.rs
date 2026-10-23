@@ -18,3 +18,19 @@ pub struct MSATokenResponse {
     pub device_rps: String,
     pub device_expiry: i64,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StoreLicenseTokenRequest {
+    pub parent_product_id: String,
+    #[serde(default, rename = "ProductId")]
+    pub product_ids: Vec<String>,
+    pub custom_developer_string: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StoreLicenseTokenResponse {
+    pub hresult: u32,
+    pub token: String,
+}
