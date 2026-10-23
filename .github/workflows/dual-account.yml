@@ -24,6 +24,8 @@ jobs:
         # A stalled Ubuntu mirror must not hold the job: bounded retries.
         timeout-minutes: 8
         run: |
+          # The runners' azure mirror stalls; use the official HTTPS archive (as upstream Nexus does).
+          sudo sed -i -E "s#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
           for attempt in 1 2 3; do
             timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update \
               && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
