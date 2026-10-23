@@ -1,26 +1,18 @@
 use std::collections::HashMap;
 
-use base64::prelude::*;
 use xal::cvlib::CorrelationVector;
 //use xal::extensions::CorrelationVectorReqwestBuilder;
 
 use crate::licensing::utils;
 use crate::models::devicecredential::License;
 use crate::models::licensing::{
-    DeviceContext, LicenseContent, LicenseContentRequest, LicenseContentResponse,
+    DeviceContext, LicenseContent, LicenseContentRequest,
     LicenseTokenRequest, LicenseTokenResponse, LicenseUserIdentity,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum LicenseContentError {
-    #[error("request error: {0}")]
-    Request(#[from] reqwest::Error),
-
-    /// The account has no entitlement for the requested content (not owned, or
-    /// not covered by the account's current subscription tier).
-    #[error("not entitled to this content: {description}")]
-    NotEntitled { description: String },
-}
+#[path = "content_response.rs"]
+mod response;
+pub use response::LicenseContentError;
 
 // we might need a bump in xal-rs concerning reqwest,
 // that might block us from using the correlationvector extension
@@ -32,8 +24,15 @@ pub async fn get_license_content(
     content_id: String,
     market: String,
 ) -> Result<(LicenseContent, License), LicenseContentError> {
+    response::fetch(content_request(client, device_ms_token, user_ms_token, ticket_reference, content_id, market)).await
+}
+
+fn content_request(
+    client: &reqwest::Client, device_ms_token: String, user_ms_token: String,
+    ticket_reference: String, content_id: String, market: String,
+) -> reqwest::RequestBuilder {
     let cv = CorrelationVector::new();
-    let response = client
+    client
         .post("https://licensing.mp.microsoft.com/v7.0/licenses/content")
         .header("from", "XboxLicenseManager")
         .header("Authorization", device_ms_token)
@@ -57,24 +56,7 @@ pub async fn get_license_content(
                 }])],
             ),
         })
-        .send()
-        .await?;
-
-    let content_res = response.json::<LicenseContentResponse>().await?;
-    let content = match content_res {
-        LicenseContentResponse::Success { license } => license,
-        LicenseContentResponse::SatisfactionFailure {
-            satisfaction_failure,
-        } => {
-            return Err(LicenseContentError::NotEntitled {
-                description: satisfaction_failure.description,
-            });
-        }
-    };
-    let license = &content.keys[0].value;
-    let license = BASE64_STANDARD.decode(license).unwrap();
-    let license = quick_xml::de::from_str::<License>(&String::from_utf8(license).unwrap()).unwrap();
-    Ok((content, license))
+        .timeout(std::time::Duration::from_secs(30))
 }
 
 pub async fn get_license_token(
