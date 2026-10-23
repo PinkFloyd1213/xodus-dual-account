@@ -64,7 +64,7 @@ async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Re
         client_id.into(), "www.microsoft.com".into(), Some(soap::PolicyReference::mbi_ssl()))
         .await.map_err(|_| FAIL)?;
     if device_response.token_type != "urn:passport:compact" { return Err(FAIL) }
-    let Token::Compact(device_token) = device_response.into() else { return Err(FAIL) };
+    let Token::Compact(device_token) = Token::try_from(device_response).map_err(|_| FAIL)? else { return Err(FAIL) };
     let user_response = xodus::api::live::exchange_user_token(&context.client, user_sts,
         account.username, device, None, Some("Silent".into()), client_id.into(),
         &[("www.microsoft.com".into(), Some(soap::PolicyReference::mbi_ssl()))])
@@ -76,7 +76,7 @@ async fn issue(context: &SimpleContext, request: StoreLicenseTokenRequest) -> Re
         _ => return Err(DENIED),
     };
     if response.token_type != "urn:passport:compact" { return Err(FAIL) }
-    let Token::Compact(user_token) = response.into() else { return Err(FAIL) };
+    let Token::Compact(user_token) = Token::try_from(response).map_err(|_| FAIL)? else { return Err(FAIL) };
     let mut response = context.client.post("https://licensing.mp.microsoft.com/v8.0/licenseToken")
         .timeout(Duration::from_secs(60)).header("from", "XboxLicenseManager")
         .header("Authorization", device_token).header("User-Agent", "XboxGameRuntime")

@@ -56,7 +56,16 @@ pub async fn request_xsts_token(
     resp.json().await
 }
 
-pub fn get_xsts_auth_header(xsts: XstsResponse) -> String {
-    let uhs = xsts.user_hash().expect("XSTS response missing xui claim");
-    format!("XBL3.0 x={uhs};{}", xsts.token)
+pub fn get_xsts_auth_header(
+    xsts: XstsResponse,
+) -> Result<String, crate::models::secrets::InvalidTokenResponse> {
+    use crate::models::secrets::InvalidTokenResponse;
+    let uhs = xsts
+        .user_hash()
+        .filter(|value| !value.is_empty())
+        .ok_or(InvalidTokenResponse)?;
+    if xsts.token.is_empty() {
+        return Err(InvalidTokenResponse);
+    }
+    Ok(format!("XBL3.0 x={uhs};{}", xsts.token))
 }

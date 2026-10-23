@@ -64,6 +64,163 @@ fn device() -> Device {
     }
 }
 
+fn user(name: &str) -> User {
+    User {
+        puid: name.into(),
+        username: name.into(),
+    }
+}
+fn session_tokens(value: &str) -> HashMap<String, Token> {
+    HashMap::from([(super::PASSPORT_STS.into(), Token::Compact(value.into()))])
+}
+#[test]
+fn credential_login_session_is_one_verified_value_and_never_merges_old_accounts_tokens() {
+    let (backend, manager) = setup();
+    manager.save_user(&user("old")).unwrap();
+    manager
+        .save_user_token(
+            super::PASSPORT_STS.into(),
+            Token::Compact("old-token".into()),
+        )
+        .unwrap();
+    let legacy = backend.values.lock().unwrap().clone();
+    manager
+        .save_user_session(user("new"), session_tokens("new-token"))
+        .unwrap();
+    assert_eq!(manager.get_user().unwrap().username, "new");
+    assert!(
+        matches!(manager.get_user_sts_token().unwrap(), Token::Compact(value) if value == "new-token")
+    );
+    for (key, value) in &legacy {
+        assert_eq!(&backend.values.lock().unwrap()[key], value);
+    }
+    manager
+        .save_user_token("renewed".into(), Token::Compact("renewed-token".into()))
+        .unwrap();
+    assert_eq!(manager.get_user().unwrap().username, "new");
+    assert!(manager.get_user_token_for("renewed").unwrap().is_some());
+    assert_eq!(
+        &backend.values.lock().unwrap()["user-tokens"],
+        &legacy["user-tokens"]
+    );
+    manager
+        .save_user_session(user("third"), session_tokens("third-token"))
+        .unwrap();
+    assert!(manager.get_user_token_for("renewed").unwrap().is_none());
+    manager.remove_persistent().unwrap();
+    assert!(manager.get_user().is_err());
+    assert!(manager.get_user_sts_token().is_err());
+}
+#[test]
+fn credential_login_session_readback_failure_never_exposes_mixed_account_and_token() {
+    for fault in ["missing", "empty", "different"] {
+        let (backend, manager) = setup();
+        manager.save_user(&user("old")).unwrap();
+        manager
+            .save_user_token(
+                super::PASSPORT_STS.into(),
+                Token::Compact("old-token".into()),
+            )
+            .unwrap();
+        *backend.fault.lock().unwrap() = Some(fault);
+        assert!(
+            manager
+                .save_user_session(user("new"), session_tokens("new-token"))
+                .is_err()
+        );
+        if let Ok(account) = manager.get_user() {
+            assert_eq!(account.username, "old");
+            assert!(
+                matches!(manager.get_user_sts_token().unwrap(), Token::Compact(value) if value == "old-token")
+            );
+        } else {
+            assert!(manager.get_user_sts_token().is_err());
+        }
+    }
+}
+#[test]
+fn credential_login_session_failed_write_preserves_previous_session_and_empty_set_is_refused() {
+    struct RefuseWrite(MemoryBackend, std::sync::atomic::AtomicBool);
+    impl TokenBackend for RefuseWrite {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+            self.0.get(key)
+        }
+        fn set(&self, key: &str, bytes: &[u8]) -> Result<(), TokenStoreError> {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("synthetic write failure").into());
+            }
+            self.0.set(key, bytes)
+        }
+        fn remove(&self, key: &str) -> Result<(), TokenStoreError> {
+            self.0.remove(key)
+        }
+    }
+    let backend = Arc::new(RefuseWrite(MemoryBackend::default(), false.into()));
+    let manager = TokenManager::new(backend.clone(), Arc::new(MemoryBackend::default()));
+    manager
+        .save_user_session(user("old"), session_tokens("old-token"))
+        .unwrap();
+    backend.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        manager
+            .save_user_session(user("new"), session_tokens("new-token"))
+            .is_err()
+    );
+    assert!(
+        manager
+            .save_user_session(user("new"), HashMap::new())
+            .is_err()
+    );
+    assert_eq!(manager.get_user().unwrap().username, "old");
+    assert!(
+        matches!(manager.get_user_sts_token().unwrap(), Token::Compact(value) if value == "old-token")
+    );
+}
+
+#[tokio::test]
+async fn credential_invalid_device_proof_returns_an_error_before_any_request() {
+    use crate::models::{secrets::LegacyToken, soap::Timestamp};
+    for secret in [None, Some("AQID".to_owned())] {
+        let token = LegacyToken {
+            key_name: None,
+            token: "synthetic".into(),
+            binary_secret: secret,
+            tpm_key: None,
+            lifetime: Timestamp {
+                id: None,
+                created: "2000-01-01T00:00:00Z".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+            },
+        };
+        let client = reqwest::Client::new();
+        assert!(
+            crate::api::live::exchange_device_token(
+                &client,
+                token.clone(),
+                "synthetic".into(),
+                "synthetic".into(),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            crate::api::live::exchange_user_token(
+                &client,
+                token.clone(),
+                "synthetic".into(),
+                token,
+                None,
+                None,
+                "synthetic".into(),
+                &[]
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
 #[test]
 fn credential_write_must_verify_device_readback() {
     for fault in ["missing", "empty", "different"] {

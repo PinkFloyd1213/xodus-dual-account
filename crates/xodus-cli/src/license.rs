@@ -54,7 +54,7 @@ pub async fn get_license(
         "Microsoft user-ticket request failed. Check your connection and sign-in.".to_string()
     })?;
 
-    let ms_device_token: Token = ms_device_token.into();
+    let ms_device_token = Token::try_from(ms_device_token).map_err(|error| error.to_string())?;
     let Token::Compact(ms_device_token) = ms_device_token else {
         return Err("Unsupported token".to_string());
     };
@@ -71,11 +71,11 @@ pub async fn get_license(
                 .into_iter()
                 .next()
                 .ok_or("Microsoft returned no content-licensing user ticket.")?;
-            token.into()
+            Token::try_from(token).map_err(|error| error.to_string())?
         }
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
             token,
-        )) => (*token).into(),
+        )) => Token::try_from(*token).map_err(|error| error.to_string())?,
         _ => return Err("Microsoft returned an unsupported content-licensing user ticket.".into()),
     };
     let Token::Compact(user_token) = user_token else {

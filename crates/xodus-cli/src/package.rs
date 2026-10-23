@@ -30,7 +30,7 @@ pub async fn get_packages(
     };
 
     let xsts_token =
-        xodus::api::xbox::run(client, dev_token, legacy, "http://update.xboxlive.com").await;
+        xodus::api::xbox::run(client, dev_token, legacy, "http://update.xboxlive.com").await?;
 
     let response = client
         .get(format!(
@@ -39,13 +39,16 @@ pub async fn get_packages(
         .header("x-xbl-contract-version", "3")
         .header(
             "Authorization",
-            xodus::api::xbox::get_xsts_auth_header(xsts_token),
+            xodus::api::xbox::get_xsts_auth_header(xsts_token)?,
         )
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .unwrap();
+        .map_err(|_| std::io::Error::other("Microsoft package request failed. Check your connection and retry."))?
+        .error_for_status()
+        .map_err(|_| std::io::Error::other("Microsoft refused the package request. Check your sign-in and retry."))?;
 
-    let res: PackageResponse = response.json().await.expect("Failed to get data");
+    let res: PackageResponse = response.json().await.map_err(|_| std::io::Error::other("Microsoft returned an unreadable package response."))?;
 
     let PackageResponse::Found(package) = res else {
         return Err(Box::new(std::io::Error::other(

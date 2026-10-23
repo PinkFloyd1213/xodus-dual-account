@@ -113,10 +113,10 @@ async fn check(context: &SimpleContext, request: Request) -> Result<String, Chec
         xodus::api::xbox::run(&client, device, user, "http://update.xboxlive.com").await
     });
     let _cancel_xsts = AbortOnDrop(xsts_task.abort_handle());
-    let xsts = xsts_task.await.map_err(|_| FAIL)?;
+    let xsts = xsts_task.await.map_err(|_| FAIL)?.map_err(|_| FAIL)?;
     let response = context.client.get(format!("{}/GetBasePackage/{id}", xodus::XBOX_LIVE_PACKAGES_PC))
         .header("x-xbl-contract-version", "3")
-        .header("Authorization", xodus::api::xbox::get_xsts_auth_header(xsts))
+        .header("Authorization", xodus::api::xbox::get_xsts_auth_header(xsts).map_err(|_| FAIL)?)
         .send().await.map_err(|_| FAIL)?;
     if response.status().as_u16() == 401 || response.status().as_u16() == 403 { return Err(DENIED.into()); }
     let mut response = response.error_for_status().map_err(|_| FAIL)?;

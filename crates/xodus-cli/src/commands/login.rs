@@ -23,7 +23,7 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         eprintln!("Invalid STS token");
         return ExitCode::FAILURE;
     };
-    let handler = LoginHandler::new(client.clone(), token, tokens.clone());
+    let handler = LoginHandler::new(client.clone(), token);
     let output = match webview::run_sessions(handler) {
         Ok(output) => output.flatten(),
         Err(error) => {
@@ -35,34 +35,44 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let issued_tokens = match output {
-        Some(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => {
+    let Some((user, body)) = output else {
+        eprintln!("Sign-in did not complete.");
+        return ExitCode::FAILURE;
+    };
+    let issued_tokens = match body {
+        soap::BodyContent::RequestSecurityTokenResponseCollection(collection) => {
             collection.security_tokens
         }
-        Some(soap::BodyContent::RequestSecurityTokenResponse(token)) => vec![*token],
-        None => {
-            eprintln!("Didn't log in");
-            vec![]
+        soap::BodyContent::RequestSecurityTokenResponse(token) => vec![*token],
+        _ => {
+            eprintln!("Microsoft returned an unsupported sign-in response.");
+            return ExitCode::FAILURE;
         }
-        _ => unreachable!(),
     };
 
-    #[cfg(not(feature = "native-webview"))]
     if issued_tokens.is_empty() {
         return ExitCode::FAILURE;
     }
+    let mut issued = std::collections::HashMap::new();
     for token in issued_tokens {
         let address = token.applies_to.endpoint_reference.address.clone();
-        let token = token.into();
+        let token = match secrets::Token::try_from(token) {
+            Ok(token) => token,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
         let address = if let secrets::Token::Legacy(legacy) = &token {
             legacy.key_name.clone().unwrap_or(address)
         } else {
             address
         };
-        if let Err(error) = tokens.save_user_token(address, token) {
-            error.report();
-            return ExitCode::FAILURE;
-        }
+        issued.insert(address, token);
+    }
+    if let Err(error) = tokens.save_user_session(user, issued) {
+        error.report();
+        return ExitCode::FAILURE;
     }
 
     ExitCode::SUCCESS
@@ -73,21 +83,15 @@ struct LoginHandler {
     device: xodus::models::secrets::LegacyToken,
     client_id: String,
     finish: bool,
-    tokens: TokenManager,
 }
 
 impl LoginHandler {
-    fn new(
-        client: reqwest::Client,
-        device: xodus::models::secrets::LegacyToken,
-        tokens: TokenManager,
-    ) -> Self {
+    fn new(client: reqwest::Client, device: xodus::models::secrets::LegacyToken) -> Self {
         Self {
             client,
             device,
             client_id: CLIENT_ID.to_string(),
             finish: false,
-            tokens,
         }
     }
 
@@ -141,7 +145,7 @@ impl LoginHandler {
 }
 
 impl webview::SessionHandler for LoginHandler {
-    type Output = Option<soap::BodyContent>;
+    type Output = Option<(secrets::User, soap::BodyContent)>;
 
     fn bootstrap(
         &mut self,
@@ -179,11 +183,11 @@ impl webview::SessionHandler for LoginHandler {
             }
             ExchangeUserTokenOutcome::Issued(da) => {
                 runtime.close_session(session_id);
-                self.tokens.save_user(&xodus::models::secrets::User {
+                let user = secrets::User {
                     puid: data.puid,
                     username: data.username,
-                })?;
-                Ok(webview::HandlerControl::Complete(Some(da)))
+                };
+                Ok(webview::HandlerControl::Complete(Some((user, da))))
             }
         }
     }

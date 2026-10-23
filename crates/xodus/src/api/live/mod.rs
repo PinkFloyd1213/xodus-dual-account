@@ -77,8 +77,8 @@ pub async fn exchange_device_token(
     scope: String,
     policy: Option<soap::PolicyReference>,
 ) -> Result<soap::RequestSecurityTokenResponse, rst::RSTError> {
-    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().unwrap())?;
-    let secret: [u8; 4096] = secret.try_into().unwrap();
+    let secret = BASE64_STANDARD.decode(token.binary_secret.as_ref().ok_or(rst::RSTError::InvalidEncryptedPayload)?)?;
+    let secret: [u8; 4096] = secret.try_into().map_err(|_| rst::RSTError::InvalidEncryptedPayload)?;
     let secret: ClepHmacState = transmute!(secret);
     let hmac_secret = secret.get_hmac_state();
 
@@ -98,10 +98,10 @@ pub async fn exchange_device_token(
     match envelope.body.body {
         soap::BodyContent::RequestSecurityTokenResponse(res) => Ok(*res),
         soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection) => {
-            let token = collection.security_tokens.remove(0);
+            let token = collection.security_tokens.drain(..).next().ok_or(rst::RSTError::InvalidEncryptedPayload)?;
             Ok(token)
         }
-        b => unimplemented!("Exchange token supports only singular token right now {b:?}"),
+        _ => Err(rst::RSTError::InvalidEncryptedPayload),
     }
 }
 
@@ -118,8 +118,8 @@ pub async fn exchange_user_token(
     hosting_app: String,
     scope_policies: &[(String, Option<soap::PolicyReference>)],
 ) -> Result<ExchangeUserTokenOutcome, rst::RSTError> {
-    let secret = BASE64_STANDARD.decode(device_token.binary_secret.as_ref().unwrap())?;
-    let secret: [u8; 4096] = secret.try_into().unwrap();
+    let secret = BASE64_STANDARD.decode(device_token.binary_secret.as_ref().ok_or(rst::RSTError::InvalidEncryptedPayload)?)?;
+    let secret: [u8; 4096] = secret.try_into().map_err(|_| rst::RSTError::InvalidEncryptedPayload)?;
     let secret: ClepHmacState = transmute!(secret);
     let hmac_secret = secret.get_hmac_state();
 
@@ -183,7 +183,7 @@ mod test {
         .await
         .unwrap();
 
-        let ms_device_token: Token = resp.into();
+        let ms_device_token = Token::try_from(resp).unwrap();
         let Token::Compact(ms_device_token) = ms_device_token else {
             todo!("Unsupported token");
         };

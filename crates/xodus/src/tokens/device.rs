@@ -231,7 +231,7 @@ fn save_device_sts_token(
         .as_ref()
         .ok_or(TokenStoreError::DeviceAuthentication)?
         .clone();
-    let token = (*resp).into();
+    let token = crate::models::secrets::Token::try_from(*resp).map_err(|_| TokenStoreError::DeviceAuthentication)?;
     if super::session::state(&token, chrono::Utc::now()) != super::session::State::Current {
         return Err(TokenStoreError::DeviceAuthentication);
     }

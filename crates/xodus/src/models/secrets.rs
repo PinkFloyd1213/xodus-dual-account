@@ -29,13 +29,22 @@ pub enum Token {
     Compact(String),
 }
 
-impl From<soap::RequestSecurityTokenResponse> for Token {
-    fn from(value: soap::RequestSecurityTokenResponse) -> Self {
-        match value.token_type.as_str() {
+#[derive(Debug, thiserror::Error)]
+#[error("Microsoft returned an incomplete or unsupported authentication token.")]
+pub struct InvalidTokenResponse;
+
+impl TryFrom<soap::RequestSecurityTokenResponse> for Token {
+    type Error = InvalidTokenResponse;
+    fn try_from(value: soap::RequestSecurityTokenResponse) -> Result<Self, Self::Error> {
+        Ok(match value.token_type.as_str() {
             "urn:passport:legacy" => {
-                let encrypted_data = value.requested_security_token.encrypted_data.unwrap();
+                let encrypted_data = value
+                    .requested_security_token
+                    .encrypted_data
+                    .ok_or(InvalidTokenResponse)?;
                 let key_name = encrypted_data.key_info.key_name.clone();
-                let token = quick_xml::se::to_string(&encrypted_data).unwrap();
+                let token =
+                    quick_xml::se::to_string(&encrypted_data).map_err(|_| InvalidTokenResponse)?;
                 let binary_secret = value
                     .requested_proof_token
                     .as_ref()
@@ -55,7 +64,7 @@ impl From<soap::RequestSecurityTokenResponse> for Token {
                 value
                     .requested_security_token
                     .binary_security_token
-                    .unwrap()
+                    .ok_or(InvalidTokenResponse)?
                     .value,
             ),
             "urn:passport:delegationcompact" => Self::Compact(format!(
@@ -63,11 +72,11 @@ impl From<soap::RequestSecurityTokenResponse> for Token {
                 value
                     .requested_security_token
                     .binary_security_token
-                    .unwrap()
+                    .ok_or(InvalidTokenResponse)?
                     .value
             )),
-            _ => unreachable!(),
-        }
+            _ => return Err(InvalidTokenResponse),
+        })
     }
 }
 
@@ -81,4 +90,89 @@ pub struct TokenStore {
 pub struct User {
     pub puid: String,
     pub username: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::soap::*;
+    fn response(kind: &str) -> RequestSecurityTokenResponse {
+        RequestSecurityTokenResponse {
+            token_type: kind.into(),
+            applies_to: AppliesTo {
+                endpoint_reference: EndpointReference {
+                    address: "synthetic.invalid".into(),
+                },
+            },
+            lifetime: Timestamp {
+                id: None,
+                created: "2000-01-01T00:00:00Z".into(),
+                expires: "2099-01-01T00:00:00Z".into(),
+            },
+            requested_security_token: RequestedSecurityToken {
+                encrypted_data: None,
+                binary_security_token: None,
+            },
+            requested_proof_token: None,
+        }
+    }
+    #[test]
+    fn credential_token_response_missing_payloads_and_unknown_types_are_errors_not_panics() {
+        for kind in [
+            "urn:passport:legacy",
+            "urn:passport:compact",
+            "urn:passport:delegationcompact",
+            "unexpected-private-payload",
+        ] {
+            let xml = format!(
+                "<Response><TokenType>{kind}</TokenType><AppliesTo><EndpointReference><Address>synthetic.invalid</Address></EndpointReference></AppliesTo><Lifetime><Created>2000-01-01T00:00:00Z</Created><Expires>2099-01-01T00:00:00Z</Expires></Lifetime><RequestedSecurityToken/></Response>"
+            );
+            let parsed: RequestSecurityTokenResponse = quick_xml::de::from_str(&xml).unwrap();
+            let error = Token::try_from(parsed).unwrap_err();
+            assert!(!error.to_string().contains("private-payload"));
+        }
+    }
+    #[test]
+    fn credential_token_response_valid_compact_delegation_and_legacy_remain_supported() {
+        for (kind, expected) in [
+            ("urn:passport:compact", "synthetic"),
+            ("urn:passport:delegationcompact", "d=synthetic"),
+        ] {
+            let mut value = response(kind);
+            value.requested_security_token.binary_security_token = Some(BinarySecurityTokenRes {
+                id: "fixture".into(),
+                value: "synthetic".into(),
+                value_type: None,
+            });
+            assert!(
+                matches!(Token::try_from(value).unwrap(), Token::Compact(token) if token == expected)
+            );
+        }
+        let mut value = response("urn:passport:legacy");
+        value.requested_security_token.encrypted_data =
+            Some(EncryptedData::devicesoftware("synthetic-ciphertext".into()));
+        assert!(
+            matches!(Token::try_from(value).unwrap(), Token::Legacy(token) if token.key_name.as_deref() == Some("http://Passport.NET/STS"))
+        );
+    }
+    #[test]
+    fn credential_xsts_missing_claim_or_token_returns_safe_error() {
+        for (claims, token, valid) in [
+            (serde_json::json!({}), "synthetic", false),
+            (serde_json::json!({"xui":[{"uhs":""}]}), "synthetic", false),
+            (serde_json::json!({"xui":[{"uhs":"hash"}]}), "", false),
+            (
+                serde_json::json!({"xui":[{"uhs":"hash"}]}),
+                "synthetic",
+                true,
+            ),
+        ] {
+            let xsts = serde_json::from_value(serde_json::json!({"NotAfter":"2099-01-01T00:00:00Z","Token":token,"DisplayClaims":claims})).unwrap();
+            let result = crate::api::xbox::get_xsts_auth_header(xsts);
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                assert_eq!(result.unwrap(), "XBL3.0 x=hash;synthetic");
+            }
+        }
+    }
 }

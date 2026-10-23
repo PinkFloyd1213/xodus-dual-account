@@ -60,8 +60,8 @@ pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Clie
         .await.map_err(|error| super::session::classify(&error)) }).await?;
     if let Some(stage) = super::session::rejection(&outcome) { return Err(stage); }
     let token: Token = match outcome {
-        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection)) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0).into(),
-        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => (*response).into(),
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection)) if !collection.security_tokens.is_empty() => Token::try_from(collection.security_tokens.remove(0)).map_err(|_| "ticket-response-parse")?,
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => Token::try_from(*response).map_err(|_| "ticket-response-parse")?,
         _ => return Err("msa-response"),
     };
     let Token::Compact(ticket) = token else { return Err("msa-ticket"); };
