@@ -134,6 +134,7 @@ pub(super) async fn store_session(
     .map_err(|error| super::session::classify(&error))
     }).await?;
     if tokens.get_user().map_err(|_| "account-check")?.username != account { return Err("account-changed"); }
+    if let Some(stage) = super::session::rejection(&outcome) { return Err(stage); }
     let token: Token = match outcome {
         ExchangeUserTokenOutcome::Issued(
             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),

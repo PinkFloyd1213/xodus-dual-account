@@ -58,6 +58,7 @@ pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Clie
         None, Some("Silent".into()), "{d6d5a677-0872-4ab0-9442-bb792fce85c5}".into(),
         &[("user.auth.xboxlive.com".into(), Some(soap::PolicyReference::mbi_ssl()))])
         .await.map_err(|error| super::session::classify(&error)) }).await?;
+    if let Some(stage) = super::session::rejection(&outcome) { return Err(stage); }
     let token: Token = match outcome {
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection)) if !collection.security_tokens.is_empty() => collection.security_tokens.remove(0).into(),
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => (*response).into(),
