@@ -7142,6 +7142,7 @@ dependencies = [
  "bergshamra-c14n",
  "cbc 0.2.1",
  "chrono",
+ "dbus",
  "dbus-secret-service-keyring-store",
  "ed25519-dalek 3.0.0",
  "globset",
