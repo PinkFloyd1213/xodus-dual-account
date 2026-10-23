@@ -29,6 +29,37 @@ use crate::models::xvd::{
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 
+#[cfg(test)]
+#[path = "download_resume_tests.rs"]
+mod resume_tests;
+
+fn matches_download_range(response: &reqwest::Response, start: u64, end: u64) -> bool {
+    let Some(range) = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes "))
+    else {
+        return false;
+    };
+    let Some((bounds, total)) = range.split_once('/') else {
+        return false;
+    };
+    let Some((first, last)) = bounds.split_once('-') else {
+        return false;
+    };
+    match (
+        first.parse::<u64>(),
+        last.parse::<u64>(),
+        total.parse::<u64>(),
+    ) {
+        (Ok(first), Ok(last), Ok(total)) => {
+            first == start && last >= first && last <= end && total > last
+        }
+        _ => false,
+    }
+}
+
 pub struct SyncSubstream<R> {
     inner: R,
     start: u64,
@@ -306,6 +337,16 @@ pub struct SegmentFile {
 impl XvdFile {
     pub fn content_id(&self) -> uuid::Uuid {
         self.header.vduid
+    }
+
+    pub fn resume_identity(&self) -> String {
+        let mut identity = self.header.signature.to_vec();
+        identity.extend(self.header.top_hash_block_hash);
+        identity.extend(self.header.original_xvc_data_hash);
+        identity.extend(self.header.user_data_hash);
+        identity.extend(self.header.vduid.as_bytes());
+        identity.extend(self.header.pduid.as_bytes());
+        crate::streaming::resume_digest(&identity)
     }
 
     fn non_encrypted_prefix_len(&self, start: u64, len: u64) -> u64 {
@@ -731,24 +772,60 @@ impl XvdFile {
         })
     }
 
-    pub async fn download_file_http<Writer, Progress>(
+    pub async fn download_file_http<Writer, Progress, Checkpoint>(
         &self,
         client: &reqwest::Client,
         url: &str,
         out: &mut Writer,
         sfile: &SegmentFile,
         full_key: [u8; 32],
-        mut progress: Progress,
+        progress: Progress,
+        pause: Option<tokio::sync::watch::Receiver<bool>>,
+        resume_offset: u64,
+        checkpoint: Checkpoint,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Writer: AsyncWrite + Unpin,
         Progress: FnMut(u64, u64),
+        Checkpoint: FnMut(u64) -> std::io::Result<()>,
+    {
+        Self::download_segment_http(
+            &self.encrypted_section_infos,
+            client,
+            url,
+            out,
+            sfile,
+            full_key,
+            progress,
+            pause,
+            resume_offset,
+            checkpoint,
+        )
+        .await
+    }
+
+    async fn download_segment_http<Writer, Progress, Checkpoint>(
+        sections: &[EncryptedSectionInfo],
+        client: &reqwest::Client,
+        url: &str,
+        out: &mut Writer,
+        sfile: &SegmentFile,
+        full_key: [u8; 32],
+        mut progress: Progress,
+        mut pause: Option<tokio::sync::watch::Receiver<bool>>,
+        resume_offset: u64,
+        mut checkpoint: Checkpoint,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        Writer: AsyncWrite + Unpin,
+        Progress: FnMut(u64, u64),
+        Checkpoint: FnMut(u64) -> std::io::Result<()>,
     {
         if sfile.length == 0 {
             return Ok(());
         }
 
-        let s = &self.encrypted_section_infos.iter().find(|s| {
+        let s = &sections.iter().find(|s| {
             sfile.offset >= s.section_offset && sfile.offset < s.section_offset + s.section_length
         });
 
@@ -778,12 +855,17 @@ impl XvdFile {
         let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
 
         let mut page = [0u8; PAGE_SIZE];
-        let mut remaining = sfile.length;
-        let mut page_in_section = page_start;
+        if resume_offset > sfile.length || resume_offset % PAGE_SIZE as u64 != 0 {
+            return Err(Box::new(io::Error::other("invalid download resume offset")));
+        }
+        let mut remaining = sfile.length - resume_offset;
+        let mut page_in_section = page_start + resume_offset / PAGE_SIZE as u64;
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let mut stream = None;
         let mut pending = bytes::BytesMut::new();
-        let mut v: u64 = 0;
+        let mut v: u64 = resume_offset;
+        let mut last_checkpoint = resume_offset;
+        let mut retries = 0;
 
         let stall_timeout = tokio::time::Duration::from_secs(5);
         if let Ok(Ok(Ok(response))) = timeout(
@@ -804,14 +886,41 @@ impl XvdFile {
         .map(|o| o.map(|o| o.error_for_status()))
             && response.status() == 206
         {
+            if !matches_download_range(&response, sfile.offset + v, sfile.offset + page_length - 1)
+            {
+                return Err(Box::new(io::Error::other(
+                    "invalid HTTP Content-Range; checkpoint preserved",
+                )));
+            }
             stream = Some(response.bytes_stream());
         }
         loop {
             if page_in_section >= page_start + page_count || remaining == 0 {
                 break;
             }
+            if let Some(control) = pause.as_mut() {
+                if *control.borrow() {
+                    // Release the HTTP connection while parked. Resuming issues
+                    // a fresh Range request at v, preserving pending partial pages.
+                    stream = None;
+                    out.flush().await?;
+                    checkpoint(sfile.length - remaining)?;
+                    control.wait_for(|paused| !*paused).await.ok();
+                }
+            }
             let next = if let Some(s) = stream.as_mut() {
-                timeout(stall_timeout, s.next()).await
+                if let Some(control) = pause.as_mut() {
+                    tokio::select! {
+                        biased;
+                        changed = control.changed() => {
+                            if changed.is_err() { pause = None; }
+                            continue;
+                        }
+                        next = timeout(stall_timeout, s.next()) => next,
+                    }
+                } else {
+                    timeout(stall_timeout, s.next()).await
+                }
             } else {
                 Ok(None)
             };
@@ -820,6 +929,12 @@ impl XvdFile {
                 data = b;
             } else {
                 // error
+                retries += 1;
+                if retries > 8 {
+                    return Err(Box::new(io::Error::other(
+                        "download stalled; retry to refresh the package URL and resume its checkpoints",
+                    )));
+                }
                 if let Ok(Ok(Ok(response))) = timeout(
                     stall_timeout,
                     client
@@ -838,12 +953,27 @@ impl XvdFile {
                 .map(|o| o.map(|o| o.error_for_status()))
                     && response.status() == 206
                 {
+                    if !matches_download_range(
+                        &response,
+                        sfile.offset + v,
+                        sfile.offset + page_length - 1,
+                    ) {
+                        return Err(Box::new(io::Error::other(
+                            "invalid HTTP Content-Range; checkpoint preserved",
+                        )));
+                    }
                     stream = Some(response.bytes_stream());
                     continue;
                 }
                 continue;
             }
 
+            retries = 0;
+            if data.len() as u64 > page_length - v {
+                return Err(Box::new(io::Error::other(
+                    "HTTP range exceeded the requested segment",
+                )));
+            }
             v += data.len() as u64;
             progress(min(v, sfile.length), sfile.length);
 
@@ -895,6 +1025,12 @@ impl XvdFile {
 
                 page_in_section += 1;
             }
+            let written = sfile.length - remaining;
+            if written.saturating_sub(last_checkpoint) >= 32 * 1024 * 1024 {
+                out.flush().await?;
+                checkpoint(written)?;
+                last_checkpoint = written;
+            }
         }
         if remaining > 0 {
             return Err(Box::new(std::io::Error::other(format!(
@@ -902,6 +1038,8 @@ impl XvdFile {
                 remaining, sfile.length, v
             ))));
         }
+        out.flush().await?;
+        checkpoint(sfile.length)?;
         Ok(())
     }
 
