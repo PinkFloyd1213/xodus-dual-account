@@ -84,6 +84,8 @@ enum SubCommand {
         exe: Option<String>,
         #[arg(long, default_value_t = false)]
         materialize_exe: bool,
+        #[arg(long, default_value_t = false)]
+        materialize_chain: bool,
         #[arg(short, long)]
         market: Option<String>,
     },
@@ -268,8 +270,9 @@ async fn main() -> ExitCode {
             wine,
             exe,
             materialize_exe,
+            materialize_chain,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, materialize_exe, market).await,
+        } => commands::run::run(&client, &tokens, source, wine, exe, materialize_exe, materialize_chain, market).await,
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,
