@@ -663,7 +663,7 @@ async fn open_http_stream(
     Ok(OpenedHttpStream {
         start: actual_start,
         len,
-        stream: Box::pin(response.bytes_stream()),
+        stream: crate::bandwidth::limit_body(response.bytes_stream()),
     })
 }
 

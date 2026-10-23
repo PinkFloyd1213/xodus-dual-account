@@ -32,7 +32,9 @@ pub(super) fn controls(
                     }
                     continue;
                 }
-                if let Some(paused) = parse_control(&bytes) {
+                if let Some(kib) = parse_download_limit(&bytes) {
+                    msixvc::bandwidth::set_limit_kib(kib);
+                } else if let Some(paused) = parse_control(&bytes) {
                     if *tx.borrow() == paused {
                         continue;
                     }
@@ -61,6 +63,19 @@ pub(super) fn controls(
     rx
 }
 
+fn parse_download_limit(bytes: &[u8]) -> Option<u32> {
+    if bytes.len()>256 {return None;}
+    let value:serde_json::Value=serde_json::from_slice(bytes).ok()?;
+    if value["schema"]!=1 || value["command"]!="set-download-limit" {return None;}
+    let kib=value["kibPerSecond"].as_u64()?;
+    (kib<=1_048_576).then_some(kib as u32)
+}
+#[cfg(test)]
+#[test]
+fn streaming_bandwidth_controls_validate_units_and_never_interpret_pause_as_a_limit() {
+    for kib in [0,1,512,1_048_576] {assert_eq!(parse_download_limit(format!(r#"{{"schema":1,"command":"set-download-limit","kibPerSecond":{kib}}}"#).as_bytes()),Some(kib));}
+    for raw in [r#"{"schema":1,"command":"pause"}"#,r#"{"schema":2,"command":"set-download-limit","kibPerSecond":1}"#,r#"{"schema":1,"command":"set-download-limit","kibPerSecond":-1}"#,r#"{"schema":1,"command":"set-download-limit","kibPerSecond":1.5}"#,r#"{"schema":1,"command":"set-download-limit","kibPerSecond":1048577}"#] {assert_eq!(parse_download_limit(raw.as_bytes()),None);}
+}
 fn parse_control(bytes: &[u8]) -> Option<bool> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     if value["schema"] != 1 {

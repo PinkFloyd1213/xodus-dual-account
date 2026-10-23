@@ -114,6 +114,8 @@ enum SubCommand {
             help = "Accept pause/resume JSON commands on stdin"
         )]
         control_stdin: bool,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=1_048_576), help = "Aggregate download bandwidth in KiB/s, 0 for unlimited; accepts live set-download-limit stdin control")]
+        download_limit_kib: u32,
         #[arg(
             long,
             default_value_t = false,
@@ -333,10 +335,12 @@ async fn main() -> ExitCode {
             selected_content_id,
             progress_json,
             control_stdin,
+            download_limit_kib,
             try_skip_ntfs,
             market,
             parallel,
         } => {
+            msixvc::bandwidth::set_limit_kib(download_limit_kib);
             commands::streaming::run(
                 &client,
                 &tokens,
