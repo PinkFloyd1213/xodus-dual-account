@@ -533,6 +533,12 @@ where
                 Poll::Pending => return Poll::Pending,
             }
 
+            // Flushing may already satisfy this read. Do not park an unnecessary
+            // upstream future that can retain the shared bandwidth limiter.
+            if self.cached_len >= target_end {
+                continue;
+            }
+
             match self.as_mut().poll_fill_from_upstream(cx) {
                 Poll::Ready(Ok(true)) => continue,
                 Poll::Ready(Ok(false)) => {
