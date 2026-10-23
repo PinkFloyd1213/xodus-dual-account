@@ -80,6 +80,16 @@ impl TryFrom<soap::RequestSecurityTokenResponse> for Token {
     }
 }
 
+/// Store and licensing services reject delegation-compact tickets in the "d="
+/// form that Xbox Live sign-in needs (InvalidMsaTicketFormat) and accept the
+/// same value as "t=". Convert only where a ticket is sent to those services.
+pub fn store_ticket(ticket: String) -> String {
+    match ticket.strip_prefix("d=") {
+        Some(value) => format!("t={value}"),
+        None => ticket,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenStore {
     #[serde(flatten)]
