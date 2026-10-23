@@ -19,6 +19,13 @@
 
 ## Baseline
 
+> **Rebased on 23.10.2026** onto Nexus 0.3.11: backend `0.2.11`, same Xodus
+> commit `53ea781`, `patchId` `linux-run-v42`, 41 patches. Previous state:
+> tags `backup/dual-account-v38` and `backup/nexus-base-v38`. Nexus 0.3.11 signs
+> out with `logout --device`; a device reset now also removes the `play`
+> account, whose tokens are bound to that device. The table below describes
+> the original (v38) baseline.
+
 | Item | Value |
 |---|---|
 | Nexus read | `domsvoboda/xodus-nexus` @ `59fb0798f034` (21.10.2026) |
@@ -299,7 +306,7 @@ result is identical to `dual-account`. Entry to add **last** in
 `patches`:
 
 ```json
-{ "file": "xodus-dual-account.patch", "sha256": "f67a556fba4eb5ca6bd0466bb878d4d1a3aabe0aef7b534232960e2cc3b363b6" }
+{ "file": "xodus-dual-account.patch", "sha256": "eef8855945cc172f3b1f2b4d88fd5f0a1f4d05ac20554361a94d2a1baa5d3276" }
 ```
 
 This is done in the Nexus fork, with `patchId` = `linux-run-v38-dual-account-N` (incremented with each new patch).
