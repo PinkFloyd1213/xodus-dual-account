@@ -10,6 +10,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use xodus::tokens::TokenManager;
 
 mod connection;
+mod account_metadata;
 mod simple_context;
 mod store_license;
 mod store_updates;

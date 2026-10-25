@@ -17,6 +17,10 @@ pub struct MSATokenResponse {
     pub expiry: i64,
     pub device_rps: String,
     pub device_expiry: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xbox_msa_account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_msa_account_id: Option<String>,
 }
 
 #[derive(Deserialize)]

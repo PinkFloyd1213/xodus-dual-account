@@ -54,7 +54,12 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
-            let Token::Legacy(token) = context.tokens().get_user_sts_token()? else {
+            let identity_session = context.tokens().get_user_sts_session()?;
+            let request_token = match &identity_session {
+                Some((_, token)) => token.clone(),
+                None => context.tokens().get_user_sts_token()?,
+            };
+            let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
             };
             let scope = if req.msa_full_trust {
@@ -122,10 +127,19 @@ pub async fn parse_message(
                     let Token::Compact(user_token) = token else {
                         return Ok(vec![]);
                     };
+                    // Store licensing uses this same session facade. Bind the
+                    // Xbox ticket's MSA principal to its current Store account,
+                    // never infer either account identifier from an Xbox XUID.
+                    let current_identity = context.tokens().get_user_sts_session().ok().flatten();
+                    let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
+                        identity_session.as_ref().map(|(user, _)| user),
+                        current_identity.as_ref().map(|(user, _)| user));
                     let payload = MSATokenResponse {
                         token: user_token,
                         expiry: expiry.timestamp(),
                         device_expiry: ms_device_rps_token.as_ref().map(|(_, r)| *r).unwrap_or(0),
+                        xbox_msa_account_id,
+                        store_msa_account_id,
                         device_rps: ms_device_rps_token
                             .map(|(t, _)| t)
                             .unwrap_or_else(String::new),

@@ -95,6 +95,39 @@ fn stage(value: serde_json::Value) -> String {
 }
 
 #[test]
+fn content_license_device_limit_is_code_based_and_never_echoes_provider_data() {
+    let denial = |code| json!({"satisfactionFailure":{"code":code,
+        "description":"private@example.test token=SECRET https://private.invalid/",
+        "alternateContentIds":["never-retry"],"remediationAction":"https://private.invalid/"}});
+    let error = parse(&serde_json::to_vec(&denial(501i64)).unwrap()).err().unwrap();
+    assert_eq!(error.stage(), "content-device-limit");
+    assert!(error.to_string().contains("Microsoft Store device limit reached"));
+    assert!(error.to_string().contains("https://account.microsoft.com/devices/content"));
+    assert!(!format!("{error:?} {error}").contains("SECRET"));
+    assert!(!error.to_string().contains("private"));
+    for code in [i64::MIN, -1, 0, 1, 500, 502, i64::MAX] {
+        assert_eq!(stage(denial(code)), "content-not-entitled");
+    }
+    for code in [json!("501"), json!(501.0), json!(null)] {
+        assert_eq!(stage(json!({"satisfactionFailure":{"code":code,"description":"private"}})), "content-schema");
+    }
+    let mut ambiguous = success(); ambiguous["satisfactionFailure"] = denial(501)["satisfactionFailure"].clone();
+    assert_eq!(stage(ambiguous), "content-schema");
+}
+
+#[tokio::test]
+async fn content_license_device_limit_http_is_not_an_http501_and_never_retries() {
+    let body = serde_json::to_vec(&json!({"satisfactionFailure":{"code":501,"description":"private"}})).unwrap();
+    for (status, expected) in [(200, "content-device-limit"), (501, "content-http"), (401, "content-http")] {
+        let (url, server) = server(format!("HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()), body.clone()).await;
+        let error = fetch(reqwest::Client::new().get(url)).await.err().unwrap();
+        assert_eq!(error.stage(), expected);
+        assert!(!error.to_string().contains("private"));
+        assert_eq!(server.await.unwrap(), 1);
+    }
+}
+
+#[test]
 fn content_license_success_preserves_existing_first_key_and_extra_fields() {
     let mut fixture = success();
     fixture["license"]["keys"]

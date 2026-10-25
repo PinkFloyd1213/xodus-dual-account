@@ -43,6 +43,8 @@ enum SubCommand {
         json: bool,
         #[arg(long, default_value = "US")]
         market: String,
+        #[arg(long, help = "Include parent-bound PC Durable packages for managed DLC installation")]
+        include_dlc: bool,
     },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
@@ -260,9 +262,12 @@ async fn main() -> ExitCode {
     }
 
     // Public preflight must not activate a keyring, provision a device or sign in.
-    if let SubCommand::ResolvePackage { product, json: _, market } = &args.command {
+    if let SubCommand::ResolvePackage { product, json: _, market, include_dlc } = &args.command {
         return match package_plan::resolve(&client, &product.to_uppercase(), &market.to_uppercase()).await {
-            Ok(plan) => { println!("{}", plan.json(&product.to_uppercase(), &market.to_uppercase())); ExitCode::SUCCESS },
+            Ok(plan) => {
+                let plan = if *include_dlc { plan } else { plan.without_durable_selection() };
+                println!("{}", plan.json(&product.to_uppercase(), &market.to_uppercase())); ExitCode::SUCCESS
+            },
             Err(error) => { eprintln!("{error}"); ExitCode::FAILURE },
         };
     }
