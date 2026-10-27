@@ -1,0 +1,39 @@
+# Tests of the store/play dual-account branch (Nexus base + dual-account patch).
+name: Dual-account
+
+on:
+  push:
+    branches: [dual-account]
+  pull_request:
+    branches: [dual-account]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - name: Install build tools
+        # A stalled Ubuntu mirror must not hold the job: bounded retries.
+        timeout-minutes: 8
+        run: |
+          # The runners' azure mirror stalls; use the official HTTPS archive (as upstream Nexus does).
+          sudo sed -i -E "s#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          for attempt in 1 2 3; do
+            timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update \
+              && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
+              && exit 0
+            echo "apt attempt $attempt failed, retrying"; sleep 10
+          done
+          exit 1
+      - run: cargo build --locked --release --no-default-features -p xodus-cli -p xodus-service
+      - run: cargo test --locked --no-default-features -p xodus credential_
+      - run: cargo test --locked --no-default-features -p xodus-cli
+      - run: cargo test --locked -p xodus-service store_
