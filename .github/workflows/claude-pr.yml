@@ -99,7 +99,7 @@ jobs:
             Finish with a short summary in French for the owner: what changed in the recipe, what you fixed,
             routing decisions, what is left for a human, and whether it looks safe to merge (with a merge
             commit, not squash). After the merge, the patch is exported to the Nexus fork automatically.
-            ${{ github.event_name == 'workflow_dispatch' && format('This run was started by hand: write the summary to /tmp/claude-summary.md and post it with `gh pr comment {0} --body-file /tmp/claude-summary.md`.', steps.pr.outputs.number) || '' }}
+            ${{ github.event_name == 'workflow_dispatch' && format('This run was started by hand: write the summary to /tmp/claude-summary.md and post it with `gh pr comment {0} -R {1} --body-file /tmp/claude-summary.md`.', steps.pr.outputs.number, github.repository) || '' }}
           claude_args: >-
             --max-turns 80
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(ls *),Bash(gh pr comment ${{ steps.pr.outputs.number }} --body-file /tmp/claude-summary.md)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(ls *),Bash(gh pr comment ${{ steps.pr.outputs.number }} -R ${{ github.repository }} --body-file /tmp/claude-summary.md)"
