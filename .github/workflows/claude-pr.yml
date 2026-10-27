@@ -62,15 +62,25 @@ jobs:
           done
           exit 1
 
+      - name: Skip Claude's own commits
+        id: own
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git log -1 --format=%B | grep -qF '[claude-review]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Latest commit is Claude's own; nothing to review."
+          fi
       - name: Claude is not configured yet
         if: env.HAS_CLAUDE_TOKEN != 'true'
         run: echo "::notice::Add the CLAUDE_CODE_OAUTH_TOKEN secret to enable the Claude review."
       - uses: anthropics/claude-code-action@v1
-        if: env.HAS_CLAUDE_TOKEN == 'true'
+        if: env.HAS_CLAUDE_TOKEN == 'true' && steps.own.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Merges bring .github/workflows changes; only SYNC_TOKEN may push those.
+          github_token: ${{ secrets.SYNC_TOKEN || github.token }}
+          # The sync workflows start this review as github-actions.
+          allowed_bots: github-actions
           # Progress comments exist only for PR events, not for a dispatched run.
           track_progress: ${{ github.event_name == 'pull_request' }}
           prompt: |
@@ -94,7 +104,7 @@ jobs:
                `cargo test --locked --no-default-features -p xodus-cli`,
                `cargo test --locked --no-default-features -p xodus credential_`,
                `cargo test --locked -p xodus-service store_`. Fix real failures; do not weaken tests.
-            4. Commit with clear messages and push with `git push origin HEAD`. Never merge the PR, never
+            4. Commit with clear messages ending with " [claude-review]" and push with `git push origin HEAD`. Never merge the PR, never
                force-push, never touch secrets, never print tokens or account data.
             Finish with a short summary in French for the owner: what changed in the recipe, what you fixed,
             routing decisions, what is left for a human, and whether it looks safe to merge (with a merge
