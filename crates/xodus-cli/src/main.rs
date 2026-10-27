@@ -93,6 +93,11 @@ enum SubCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Explicit Xbox friends and text chat, JSON request on standard input")]
+    Social {
+        #[arg(long, required = true)]
+        json: bool,
+    },
     #[command(about = "Read Xbox time played and last activity for one title without starting sign-in")]
     GameActivity {
         title_id: u32,
@@ -287,6 +292,7 @@ async fn main() -> ExitCode {
         args.command,
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
+            | SubCommand::Social { .. }
             | SubCommand::GameActivity { .. }
             | SubCommand::Achievements { .. }
             | SubCommand::Library { .. }
@@ -358,6 +364,7 @@ async fn main() -> ExitCode {
             }
         },
         SubCommand::Profile { json } => commands::profile::run(&tokens, json).await,
+        SubCommand::Social { .. } => commands::social::run(&tokens).await,
         SubCommand::GameActivity { title_id, json } => commands::game_activity::run(&tokens, title_id, json).await,
         SubCommand::Achievements { title_id, json } => commands::achievements::run(&tokens, title_id, json).await,
         SubCommand::Login => commands::login::run(&client, &tokens).await,
