@@ -48,16 +48,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.0'
+      - name: Restore downloaded Ubuntu packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-noble-native-v1
       - name: Install build tools
         # A stalled Ubuntu mirror must not hold the job: bounded retries.
         timeout-minutes: 8
         run: |
           # The runners' azure mirror stalls; use the official HTTPS archive (as upstream Nexus does).
-          sudo sed -i -E "s#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          # Runner images route apt through apt-mirrors.txt, so rewrite that list as well.
+          sudo sed -i -E "s#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          mkdir -p ~/apt-archives/partial
           for attempt in 1 2 3; do
             timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update \
-              && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
-              && exit 0
+              && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Dir::Cache::Archives="$HOME/apt-archives" install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
+              && sudo chown -R "$USER" ~/apt-archives && exit 0
             echo "apt attempt $attempt failed, retrying"; sleep 10
           done
           exit 1
