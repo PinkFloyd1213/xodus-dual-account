@@ -46,4 +46,4 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: >-
             --max-turns 40
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD)"
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(head *),Bash(tail *),Bash(wc *),Bash(grep *),Bash(sort *),Bash(uniq *),Bash(cat *),Bash(sed -n *),Bash(diff *),Bash(find *),Bash(sha256sum *),Bash(git rev-parse *),Bash(git branch *),Bash(git remote *),Bash(git -C /tmp/*),Bash(git clone *),Bash(git ls-files *),Bash(git apply --check *),Bash(cd *)"
