@@ -20,8 +20,25 @@ pub struct Choice {
     pub format: String,
     pub kind: String,
     pub supported: bool,
+    pub parent_product_id: Option<String>,
+    pub main_package_family_name: Option<String>,
+    pub download_bytes: Option<u64>,
+    pub install_bytes: Option<u64>,
 }
 pub struct Plan { pub choices: Vec<Choice> }
+
+fn size(package: &Value, key: &str) -> Option<u64> {
+    package[key].as_u64().filter(|n| *n > 0 && *n <= 9_007_199_254_740_991)
+}
+
+impl Choice {
+    fn merge_estimates(&mut self, other: &Self) {
+        // Catalog duplicates can disagree. Keep the largest eligible estimate,
+        // never a trial/preorder or another content package's advertised size.
+        self.download_bytes = self.download_bytes.max(other.download_bytes);
+        self.install_bytes = self.install_bytes.max(other.install_bytes);
+    }
+}
 
 fn product_id(id: &str) -> bool {
     id.len() == 12 && id.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
@@ -32,6 +49,24 @@ fn text(value: &Value, key: &str) -> String {
 fn list<'a>(value: &'a Value, key: &str) -> &'a [Value] {
     value[key].as_array().map(Vec::as_slice).unwrap_or(&[])
 }
+fn dlc_parent(product: &Value) -> Option<String> {
+    let mut parents = HashSet::new();
+    for market in list(product, "MarketProperties") {
+        for relation in list(market, "RelatedProducts") {
+            if relation["RelationshipType"].as_str() != Some("addOnParent") { continue; }
+            let id = relation["RelatedProductId"].as_str()?;
+            if !product_id(id) || product["ProductId"].as_str() == Some(id) { return None; }
+            parents.insert(id.to_string());
+        }
+    }
+    if parents.len() == 1 { parents.into_iter().next() } else { None }
+}
+fn package_family(value: &str) -> bool {
+    let Some((name, publisher)) = value.split_once('_') else { return false };
+    value.len() <= 200 && !name.is_empty() && !publisher.is_empty()
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+        && publisher.bytes().all(|c| c.is_ascii_alphanumeric())
+}
 
 // Only explicit bundle membership describes downloadable children. Licensing
 // keys name offers that grant this product, not products contained in it.
@@ -41,6 +76,7 @@ fn inspect(product: &Value, id: &str) -> Result<(Vec<Choice>, Vec<String>), Stri
     let title = text(localized, "ProductTitle");
     let title = if title.is_empty() { id.to_string() } else { title };
     let kind = text(product, "ProductType");
+    let parent_product_id = if kind == "Durable" { dlc_parent(product) } else { None };
     let mut choices: BTreeMap<(String, String, String), Choice> = BTreeMap::new();
     let mut bundled = HashSet::new();
     for availability in list(product, "DisplaySkuAvailabilities") {
@@ -53,18 +89,27 @@ fn inspect(product: &Value, id: &str) -> Result<(Vec<Choice>, Vec<String>), Stri
                 .map(|v| text(v, "PlatformName")).filter(|s| !s.is_empty()).collect();
             let desktop = platforms.iter().any(|p| p == "Windows.Desktop");
             let format = text(package, "PackageFormat").to_uppercase();
+            let main_package_family_name = package["MainPackageFamilyNameForDlc"].as_str()
+                .filter(|name| package_family(name)).map(str::to_string);
+            let durable = kind == "Durable" && parent_product_id.is_some() && main_package_family_name.is_some()
+                && list(package, "Architectures").iter().any(|arch| arch.as_str() == Some("x64"));
             let supported = desktop && format == "MSIXVC"
-                && (kind == "Game" || kind == "GameAddOn")
+                && (kind == "Game" || kind == "GameAddOn" || durable)
                 && properties["IsTrial"].as_bool() != Some(true)
                 && properties["IsPreOrder"].as_bool() != Some(true);
             let platform = if desktop { "Windows.Desktop".to_string() } else { platforms.join(", ") };
             let key = (content_id.clone(), platform.clone(), format.clone());
             let choice = Choice {
                 product_id: id.to_string(), content_id, title: title.clone(), platform, format, kind: kind.clone(), supported,
+                parent_product_id: parent_product_id.clone(), main_package_family_name,
+                download_bytes: size(package,"MaxDownloadSizeInBytes"),
+                install_bytes: size(package,"MaxInstallSizeInBytes"),
             };
             // The same package can appear in preorder, retail and trial SKUs.
             // Preserve an eligible retail SKU regardless of catalog ordering.
-            if !choices.get(&key).is_some_and(|old| old.supported) { choices.insert(key, choice); }
+            if let Some(old) = choices.get_mut(&key).filter(|old| old.supported) {
+                if choice.supported { old.merge_estimates(&choice); }
+            } else { choices.insert(key, choice); }
         }
         for reference in list(properties, "BundledSkus") {
             if let Some(child) = reference["BigId"].as_str().filter(|v| product_id(v)) { bundled.insert(child.to_string()); }
@@ -89,7 +134,9 @@ pub fn from_products(root: &str, products: &BTreeMap<String, Value>) -> Result<P
         let (direct, children) = inspect(product, id)?;
         for choice in direct {
             let key = choice.content_id.clone();
-            if !choices.get(&key).is_some_and(|old| old.supported) { choices.insert(key, choice); }
+            if let Some(old) = choices.get_mut(&key).filter(|old| old.supported) {
+                if choice.supported { old.merge_estimates(&choice); }
+            } else { choices.insert(key, choice); }
         }
         if choices.len() > MAX_CHOICES { return Err("Too many Store packages".into()); }
         for child in children { walk(&child, products, path, seen, choices, depth + 1)?; }
@@ -102,6 +149,10 @@ pub fn from_products(root: &str, products: &BTreeMap<String, Value>) -> Result<P
 }
 
 impl Plan {
+    pub fn without_durable_selection(mut self) -> Self {
+        for choice in &mut self.choices { if choice.kind == "Durable" { choice.supported = false; } }
+        self
+    }
     pub fn automatic(&self) -> Option<&Choice> {
         let eligible: Vec<_> = self.choices.iter().filter(|c| c.supported).collect();
         if eligible.len() == 1 && eligible[0].kind == "Game" { Some(eligible[0]) } else { None }
@@ -119,7 +170,9 @@ impl Plan {
         json!({"schema":1,"rootProductId":root,"market":market,
             "status":if self.automatic().is_some() {"ready"} else if self.choices.iter().any(|c| c.supported) {"choice"} else {"unavailable"},
             "choices":self.choices.iter().map(|c| json!({"productId":c.product_id,"contentId":c.content_id,"title":c.title,
-                "platform":c.platform,"packageFormat":c.format,"kind":c.kind,"supported":c.supported})).collect::<Vec<_>>()})
+                "platform":c.platform,"packageFormat":c.format,"kind":c.kind,"supported":c.supported,
+                "parentProductId":c.parent_product_id,"mainPackageFamilyName":c.main_package_family_name,
+                "downloadBytes":c.download_bytes,"installBytes":c.install_bytes})).collect::<Vec<_>>()})
     }
 }
 
@@ -165,6 +218,48 @@ async fn resolve_from(client: &reqwest::Client, root: &str, market: &str, catalo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_storage_estimates_are_optional_positive_and_bound_to_the_selected_content() {
+        let mut product = package(ROOT,"Windows.Desktop","MSIXVC");
+        let p = &mut product["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0];
+        p["MaxDownloadSizeInBytes"] = json!(2_069_975_040u64);
+        p["MaxInstallSizeInBytes"] = json!(3_000_000_000u64);
+        let plan = from_products(ROOT,&BTreeMap::from([(ROOT.into(),product.clone())])).unwrap();
+        let choice = &plan.json(ROOT,"US")["choices"][0];
+        assert_eq!(choice["downloadBytes"],2_069_975_040u64);
+        assert_eq!(choice["installBytes"],3_000_000_000u64);
+        assert_eq!(plan.select(None).unwrap(),CID);
+        for value in [Value::Null,json!(0),json!(-1),json!(1.5),json!("100"),json!(9_007_199_254_740_992u64)] {
+            let p = &mut product["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0];
+            p["MaxDownloadSizeInBytes"] = value.clone();p["MaxInstallSizeInBytes"] = value;
+            let plan = from_products(ROOT,&BTreeMap::from([(ROOT.into(),product.clone())])).unwrap();
+            let choice = &plan.json(ROOT,"US")["choices"][0];
+            assert!(choice["downloadBytes"].is_null());assert!(choice["installBytes"].is_null());
+            assert_eq!(plan.select(None).unwrap(),CID);
+        }
+    }
+
+    #[test]
+    fn package_storage_estimates_merge_retail_duplicates_without_using_trial_or_foreign_sizes() {
+        let mut product = package(ROOT,"Windows.Desktop","MSIXVC");
+        product["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0]["MaxDownloadSizeInBytes"] = json!(100);
+        let mut retail = product["DisplaySkuAvailabilities"][0].clone();
+        retail["Sku"]["Properties"]["Packages"][0]["MaxDownloadSizeInBytes"] = json!(200);
+        let mut trial = retail.clone();trial["Sku"]["Properties"]["IsTrial"] = json!(true);
+        trial["Sku"]["Properties"]["Packages"][0]["MaxDownloadSizeInBytes"] = json!(999);
+        let mut other = retail.clone();other["Sku"]["Properties"]["Packages"][0]["ContentId"] = json!("22222222-2222-4222-8222-222222222222");
+        other["Sku"]["Properties"]["Packages"][0]["MaxDownloadSizeInBytes"] = json!(500);
+        for reversed in [false,true] {
+            let base = product["DisplaySkuAvailabilities"][0].clone();
+            let mut skus = vec![base,retail.clone(),trial.clone(),other.clone()];if reversed {skus.reverse();}
+            product["DisplaySkuAvailabilities"] = json!(skus);
+            let plan = from_products(ROOT,&BTreeMap::from([(ROOT.into(),product.clone())])).unwrap();
+            let choices = plan.json(ROOT,"US")["choices"].as_array().unwrap().clone();
+            assert_eq!(choices.len(),2);
+            assert_eq!(choices.iter().find(|c|c["contentId"]==CID).unwrap()["downloadBytes"],200);
+            assert_eq!(choices.iter().find(|c|c["contentId"]!=CID).unwrap()["downloadBytes"],500);
+        }
+    }
     const ROOT: &str = "9AAAAAAAAAAA";
     const CHILD: &str = "9BBBBBBBBBBB";
     const CID: &str = "11111111-1111-4111-8111-111111111111";
@@ -174,6 +269,45 @@ mod tests {
     }
     fn bundle(id: &str, children: &[&str]) -> Value {
         json!({"ProductId":id,"DisplaySkuAvailabilities":[{"Sku":{"Properties":{"BundledSkus":children.iter().map(|id| json!({"BigId":id})).collect::<Vec<_>>()}}}]})
+    }
+    fn durable() -> Value {
+        let mut p = package(CHILD, "Windows.Desktop", "MSIXVC");
+        p["ProductType"] = json!("Durable");
+        p["MarketProperties"] = json!([{ "RelatedProducts": [{ "RelationshipType": "addOnParent", "RelatedProductId": ROOT }] }]);
+        p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["IsTrial"] = json!(false);
+        let pkg = &mut p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0];
+        pkg["Architectures"] = json!(["x64"]);
+        pkg["MainPackageFamilyNameForDlc"] = json!("Example.Base_hash");
+        p
+    }
+    #[test] fn durable_pc_package_requires_explicit_selection_and_verified_parent_metadata() {
+        let plan = from_products(CHILD, &BTreeMap::from([(CHILD.into(), durable())])).unwrap();
+        assert_eq!(plan.json(CHILD, "US")["status"], "choice");
+        assert!(plan.select(None).is_err());
+        assert_eq!(plan.select(Some(CID)).unwrap(), CID);
+        let value = plan.json(CHILD, "US");
+        assert_eq!(value["choices"][0]["parentProductId"], ROOT);
+        assert_eq!(value["choices"][0]["mainPackageFamilyName"], "Example.Base_hash");
+        let legacy = from_products(CHILD, &BTreeMap::from([(CHILD.into(), durable())])).unwrap().without_durable_selection();
+        assert_eq!(legacy.json(CHILD, "US")["status"], "unavailable");
+        assert!(legacy.select(Some(CID)).is_err());
+    }
+    #[test] fn durable_missing_foreign_or_ambiguous_parent_and_non_pc_formats_stay_unsupported() {
+        for variant in 0..8 {
+            let mut p = durable();
+            match variant {
+                0 => p["MarketProperties"] = json!([]),
+                1 => p["MarketProperties"][0]["RelatedProducts"][0]["RelatedProductId"] = json!("bad-id"),
+                2 => p["MarketProperties"][0]["RelatedProducts"].as_array_mut().unwrap().push(json!({"RelationshipType":"addOnParent","RelatedProductId":"9CCCCCCCCCCC"})),
+                3 => p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0]["MainPackageFamilyNameForDlc"] = json!("../outside"),
+                4 => p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0]["Architectures"] = json!(["arm64"]),
+                5 => p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["Packages"][0]["PackageFormat"] = json!("APPX"),
+                6 => p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["IsTrial"] = json!(true),
+                _ => p["DisplaySkuAvailabilities"][0]["Sku"]["Properties"]["IsPreOrder"] = json!(true),
+            }
+            let plan = from_products(CHILD, &BTreeMap::from([(CHILD.into(), p)])).unwrap();
+            assert!(plan.select(Some(CID)).is_err(), "variant {variant}");
+        }
     }
     #[test] fn direct_and_selected_membership() {
         let plan = from_products(ROOT, &BTreeMap::from([(ROOT.into(), package(ROOT,"Windows.Desktop","MSIXVC"))])).unwrap();

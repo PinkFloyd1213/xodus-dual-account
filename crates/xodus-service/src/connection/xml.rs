@@ -81,7 +81,12 @@ pub async fn parse_message(
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
             let tokens = tokens.ok_or(xodus::models::secrets::InvalidTokenResponse)?;
-            let Token::Legacy(token) = tokens.get_user_sts_token()? else {
+            let identity_session = tokens.get_user_sts_session()?;
+            let request_token = match &identity_session {
+                Some((_, token)) => token.clone(),
+                None => tokens.get_user_sts_token()?,
+            };
+            let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
             };
             let scope = if req.msa_full_trust {
@@ -150,10 +155,21 @@ pub async fn parse_message(
                     let Token::Compact(user_token) = token else {
                         return Ok(vec![]);
                     };
+                    // Bind the Xbox ticket's MSA principal to its own (play) session,
+                    // re-read to reject a change mid-exchange, and the Store id to
+                    // the store session; never infer either from an Xbox XUID.
+                    let current_identity = tokens.get_user_sts_session().ok().flatten();
+                    let store_identity = context.tokens().get_user_sts_session().ok().flatten();
+                    let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids_for_roles(
+                        identity_session.as_ref().map(|(user, _)| user),
+                        current_identity.as_ref().map(|(user, _)| user),
+                        store_identity.as_ref().map(|(user, _)| user));
                     let payload = MSATokenResponse {
                         token: user_token,
                         expiry: expiry.timestamp(),
                         device_expiry: ms_device_rps_token.as_ref().map(|(_, r)| *r).unwrap_or(0),
+                        xbox_msa_account_id,
+                        store_msa_account_id,
                         device_rps: ms_device_rps_token
                             .map(|(t, _)| t)
                             .unwrap_or_else(String::new),

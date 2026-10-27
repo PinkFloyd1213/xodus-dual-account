@@ -127,7 +127,8 @@ pub async fn run(
             let content_id = if Uuid::try_parse(&source).is_err() {
                 let region = market.clone().unwrap_or("US".into()).to_uppercase();
                 let content_id_task = match crate::package_plan::resolve(client, &source.to_uppercase(), &region).await {
-                    Ok(plan) => plan.select(selected_content_id.as_deref()),
+                    Ok(plan) => if selected_content_id.is_some() { plan.select(selected_content_id.as_deref()) }
+                        else { plan.without_durable_selection().select(None) },
                     Err(error) => Err(error),
                 };
                 let Ok(content_id) = content_id_task else {

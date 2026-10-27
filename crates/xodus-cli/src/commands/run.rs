@@ -76,19 +76,60 @@ fn select_launch_entry<'a>(
     if let Some(selected) = selected {
         let selected_path = checked_relative_path(selected)?;
         let selected_path = selected_path.to_string_lossy();
-        return fds.iter().copied().find(|(name, _)| {
+        let matching: Vec<_> = fds.iter().copied().filter(|(name, _)| {
             checked_relative_path(name).is_ok_and(|candidate| {
                 candidate.to_string_lossy().eq_ignore_ascii_case(&selected_path)
             })
-        }).ok_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("selected executable is not present in encrypted package metadata: {selected}"),
-        ));
+        }).collect();
+        let exact: Vec<_> = matching.iter().copied().filter(|(name, _)| {
+            checked_relative_path(name).is_ok_and(|candidate| candidate.to_string_lossy() == selected_path)
+        }).collect();
+        let matching = if exact.is_empty() { matching } else { exact };
+        return match matching.as_slice() {
+            [entry] => Ok(*entry),
+            [] => Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                format!("selected executable is not present in package launch images: {selected}"))),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                "selected executable has ambiguous package launch images")),
+        };
     }
     fds.first().copied().ok_or_else(|| std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "no encrypted launch image was found",
     ))
+}
+
+async fn prepare_plain_launch_entry(
+    source: &Path,
+    files: &HashMap<String, SegmentFile>,
+    selected: Option<&str>,
+) -> std::io::Result<Option<(String, std::fs::File)>> {
+    let Some(selected) = selected else { return Ok(None); };
+    let selected = checked_relative_path(selected)?;
+    let selected = selected.to_string_lossy();
+    let matching: Vec<_> = files.iter().filter(|(name, _)| {
+        checked_relative_path(name).is_ok_and(|name| name.to_string_lossy().eq_ignore_ascii_case(&selected))
+    }).collect();
+    let exact: Vec<_> = matching.iter().copied().filter(|(name, _)| {
+        checked_relative_path(name).is_ok_and(|name| name.to_string_lossy() == selected)
+    }).collect();
+    let matching = if exact.is_empty() { matching } else { exact };
+    if matching.len() > 1 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "selected executable has ambiguous package metadata"));
+    }
+    let Some((name, content)) = matching.first() else { return Ok(None); };
+    // Missing metadata or encrypted declarations never become an arbitrary
+    // plaintext fallback. The license and encrypted-image paths remain intact.
+    if content.keep_encrypted { return Ok(None); }
+    let relative = resolve_package_file(source, name)?;
+    let actual_name = relative.to_string_lossy().replace('/', "\\");
+    let file = open_launch_image(&source.join(relative), &actual_name, content).await?.into_std().await;
+    let mut signature = [0u8; 2];
+    file.read_exact_at(&mut signature, 0).map_err(|e| launch_image_error(&actual_name, "could not read plain launch image", e))?;
+    if signature != *b"MZ" {
+        return Err(launch_image_error(&actual_name, "invalid plain launch image", std::io::Error::new(std::io::ErrorKind::InvalidData, "not a PE file")));
+    }
+    Ok(Some((actual_name.clone(), inherit_launch_image(file, &actual_name)?)))
 }
 
 fn wine_exit_code(status: std::process::ExitStatus) -> u8 {
@@ -223,6 +264,40 @@ fn populate_launch_view(
     Ok(())
 }
 
+fn probe_launch_view_links(directory: &Path) -> std::io::Result<()> {
+    let probe = directory.join(".xodus-link-probe");
+    symlink(".", &probe)?;
+    std::fs::remove_file(probe)
+}
+
+fn launch_view_directory_with(
+    source_root: &Path,
+    fallback: &Path,
+    prefix: &str,
+    mut probe: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<TempDir> {
+    let parent = source_root.parent().unwrap_or(fallback);
+    if let Ok(directory) = Builder::new().prefix(prefix).tempdir_in(parent) {
+        match probe(directory.path()) {
+            Ok(()) => return Ok(directory),
+            Err(error) if matches!(error.raw_os_error(), Some(nix::libc::EPERM | nix::libc::EOPNOTSUPP | nix::libc::ENOSYS)) => {
+                // Some install filesystems allow directories but not symlinks.
+                // Drop only this private empty view, then try the ordinary temp
+                // directory once. Never change mount/security settings or copy
+                // the whole game as a substitute for the links.
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let directory = Builder::new().prefix(prefix.trim_start_matches('.')).tempdir_in(fallback)?;
+    probe(directory.path())?;
+    Ok(directory)
+}
+
+fn launch_view_directory(source_root: &Path, prefix: &str) -> std::io::Result<TempDir> {
+    launch_view_directory_with(source_root, &std::env::temp_dir(), prefix, probe_launch_view_links)
+}
+
 fn create_launch_chain_mirror(
     source_root: &Path,
     entry_suffix: &str,
@@ -238,7 +313,7 @@ fn create_launch_chain_mirror(
     if !decrypted.contains_key(&entry_path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "selected executable is not present in encrypted package metadata",
+            "selected executable is not present in package launch images",
         ));
     }
     let mut real_directories = HashSet::new();
@@ -253,11 +328,7 @@ fn create_launch_chain_mirror(
         }
     }
     let decrypted_files: HashSet<PathBuf> = decrypted.keys().cloned().collect();
-    let parent = source_root.parent().unwrap_or_else(|| Path::new("/tmp"));
-    let mirror = Builder::new()
-        .prefix(".xodus-chain-")
-        .tempdir_in(parent)
-        .or_else(|_| Builder::new().prefix("xodus-chain-").tempdir())?;
+    let mirror = launch_view_directory(source_root, ".xodus-chain-")?;
     populate_launch_view(
         source_root,
         mirror.path(),
@@ -278,11 +349,7 @@ fn create_launch_mirror(
     source_root: &Path,
     entry_suffix: &str,
 ) -> std::io::Result<(TempDir, PathBuf)> {
-    let parent = source_root.parent().unwrap_or_else(|| Path::new("/tmp"));
-    let mirror = Builder::new()
-        .prefix(".xodus-offline-")
-        .tempdir_in(parent)
-        .or_else(|_| Builder::new().prefix("xodus-offline-").tempdir())?;
+    let mirror = launch_view_directory(source_root, ".xodus-offline-")?;
     let components: Vec<&str> = entry_suffix
         .split(['\\', '/'])
         .filter(|component| !component.is_empty())
@@ -572,6 +639,15 @@ pub async fn run(
     // All launch-view paths and file maps must use the resolved on-disk case,
     // not only the import readiness check or the selected executable name.
     // Keep ownership until launch finishes, including failure cleanup paths.
+    match prepare_plain_launch_entry(out, &lfiles, exe.as_deref()).await {
+        Ok(Some(image)) => opened_images.push(image),
+        Ok(None) => (),
+        Err(error) => {
+            eprintln!("failed to prepare selected package executable: {error}");
+            cleanup().await;
+            return ExitCode::FAILURE;
+        }
+    }
     let fds: Vec<_> = opened_images.iter().map(|(name, file)| (name, file.as_raw_fd())).collect();
 
     let (entry_name, entry_fd) = match select_launch_entry(&fds, exe.as_deref()) {
@@ -874,6 +950,131 @@ mod tests {
     #[test]
     fn launch_chain_rejects_parent_path_components() {
         assert!(checked_relative_path("..\\outside.exe").is_err());
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_uses_only_declared_package_images_and_preserves_sources() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Bin")).unwrap();
+        let original = fake_pe();
+        std::fs::write(root.path().join("Bin/MINECRAFT.WINDOWS.EXE"), &original).unwrap();
+        std::fs::write(root.path().join("MicrosoftGame.config"), b"metadata unchanged").unwrap();
+        let metadata = HashMap::from([(String::from("Bin\\Minecraft.Windows.exe"), SegmentFile { offset: 0, length: original.len() as u64, data_hashs: vec![], keep_encrypted: false })]);
+        let (name, file) = prepare_plain_launch_entry(root.path(), &metadata, Some("bin/Minecraft.Windows.exe")).await.unwrap().unwrap();
+        assert_eq!(name, "Bin\\MINECRAFT.WINDOWS.EXE");
+        assert!(!fcntl_getfd(file.as_fd()).unwrap().contains(FdFlags::CLOEXEC));
+        let dll_name = String::from("Encrypted.dll");
+        let mut dll = tempfile::tempfile().unwrap(); dll.write_all(b"synthetic decrypted library").unwrap();
+        let images = [(&dll_name, dll.as_raw_fd()), (&name, file.as_raw_fd())];
+        assert!(select_launch_entry(&images[..1], Some("bin/Minecraft.Windows.exe")).is_err());
+        assert_eq!(select_launch_entry(&images, Some("bin/Minecraft.Windows.exe")).unwrap().1, file.as_raw_fd());
+        let (mirror, entry, count, bytes) = create_launch_chain_mirror(root.path(), &name, &images).unwrap();
+        assert_eq!(count, 1); assert_eq!(bytes, original.len() as u64);
+        assert_eq!(std::fs::read(entry).unwrap(), original);
+        let (nt, _) = launch_file_maps(&images, root.path(), Some("\\synthetic-view"), &name, file.as_raw_fd(), &mirror.path().join("Bin/MINECRAFT.WINDOWS.EXE"), true);
+        assert!(nt.contains("synthetic-view\\Encrypted.dll"));
+        assert!(!nt.contains("synthetic-view\\Bin\\MINECRAFT.WINDOWS.EXE"));
+        assert_eq!(std::fs::read(root.path().join("Bin/MINECRAFT.WINDOWS.EXE")).unwrap(), original);
+        assert_eq!(std::fs::read(root.path().join("MicrosoftGame.config")).unwrap(), b"metadata unchanged");
+    }
+
+    #[test]
+    fn launch_entry_prefers_exact_case_and_refuses_ambiguous_case_fallbacks() {
+        let names = [String::from("Game.exe"), String::from("GAME.EXE")];
+        let images = [(&names[0], 42), (&names[1], 43)];
+        assert_eq!(select_launch_entry(&images, Some("GAME.EXE")).unwrap().1, 43);
+        assert_eq!(select_launch_entry(&images, Some("Game.exe")).unwrap().1, 42);
+        assert!(select_launch_entry(&images, Some("game.exe")).is_err());
+        assert!(select_launch_entry(&[(&names[0], 42), (&names[0], 43)], Some("Game.exe")).is_err());
+        assert_eq!(select_launch_entry(&images, None).unwrap().1, 42);
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_never_treats_an_encrypted_or_undeclared_file_as_plaintext() {
+        let root = tempfile::tempdir().unwrap(); let original = fake_pe();
+        std::fs::write(root.path().join("Game.exe"), &original).unwrap();
+        let mut metadata = HashMap::from([(String::from("Game.exe"), SegmentFile { offset: 0, length: original.len() as u64, data_hashs: vec![], keep_encrypted: true })]);
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Other.exe")).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, None).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("../Game.exe")).await.is_err());
+        metadata.get_mut("Game.exe").unwrap().keep_encrypted = false;
+        metadata.get_mut("Game.exe").unwrap().length += 1;
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.is_err());
+        metadata.get_mut("Game.exe").unwrap().length = original.len() as u64;
+        std::fs::write(root.path().join("Game.exe"), vec![0; original.len()]).unwrap();
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.is_err());
+        assert_eq!(std::fs::read(root.path().join("Game.exe")).unwrap(), vec![0; original.len()]);
+    }
+
+    #[tokio::test]
+    async fn plain_launch_entry_rejects_ambiguous_metadata_and_outside_package_links() {
+        let root = tempfile::tempdir().unwrap(); let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Game.exe"), fake_pe()).unwrap();
+        let mut metadata = HashMap::new();
+        for name in ["Game.exe", "GAME.EXE"] { metadata.insert(name.to_owned(), SegmentFile { offset: 0, length: 1024, data_hashs: vec![], keep_encrypted: false }); }
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Game.exe")).await.unwrap().is_some());
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("game.exe")).await.is_err());
+        std::fs::write(outside.path().join("Game.exe"), fake_pe()).unwrap();
+        symlink(outside.path().join("Game.exe"), root.path().join("Outside.exe")).unwrap();
+        metadata.insert("Outside.exe".to_owned(), SegmentFile { offset: 0, length: 1024, data_hashs: vec![], keep_encrypted: false });
+        assert!(prepare_plain_launch_entry(root.path(), &metadata, Some("Outside.exe")).await.is_err());
+    }
+
+    #[test]
+    fn launch_directory_falls_back_when_install_filesystem_cannot_create_links() {
+        for code in [nix::libc::EPERM, nix::libc::EOPNOTSUPP, nix::libc::ENOSYS] {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join("non-link-filesystem");
+            let fallback = root.path().join("normal temporary filesystem");
+            std::fs::create_dir_all(parent.join("game")).unwrap();
+            std::fs::create_dir(&fallback).unwrap();
+            std::fs::write(parent.join("game/original.bin"), b"unchanged").unwrap();
+            let mut attempts = Vec::new();
+            let result = launch_view_directory_with(&parent.join("game"), &fallback, ".xodus-chain-", |path| {
+                attempts.push(path.to_owned());
+                if path.parent() == Some(parent.as_path()) { return Err(std::io::Error::from_raw_os_error(code)); }
+                probe_launch_view_links(path)
+            }).unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(result.path().parent(), Some(fallback.as_path()));
+            assert!(!attempts[0].exists());
+            assert_eq!(std::fs::read(parent.join("game/original.bin")).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read_dir(result.path()).unwrap().count(), 0);
+            let path = result.path().to_owned(); drop(result); assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn launch_directory_keeps_supported_install_filesystem_and_cleans_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("game")).unwrap();
+        let directory = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", probe_launch_view_links).unwrap();
+        assert_eq!(directory.path().parent(), Some(root.path()));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_directory_does_not_hide_unrelated_io_failures_or_retry_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("game")).unwrap();
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |_| {
+            calls += 1; Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |_| {
+            calls += 1; Err(std::io::Error::from_raw_os_error(nix::libc::EPERM))
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM));
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
     }
 
     #[test]

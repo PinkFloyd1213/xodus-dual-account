@@ -50,6 +50,10 @@ pub enum LicenseContentError {
     )]
     NotEntitled,
     #[error(
+        "Microsoft Store device limit reached. Open https://account.microsoft.com/devices/content, unlink an old device you no longer use, then try again. You do not need to sign out or reset the wallet."
+    )]
+    DeviceLimit,
+    #[error(
         "Microsoft returned a content license without a key. Share the backend diagnostic log."
     )]
     EmptyKeys,
@@ -82,6 +86,7 @@ impl LicenseContentError {
             Self::Json => "content-json",
             Self::Schema => "content-schema",
             Self::NotEntitled => "content-not-entitled",
+            Self::DeviceLimit => "content-device-limit",
             Self::EmptyKeys => "content-empty-keys",
             Self::Base64 => "content-base64",
             Self::Utf8 => "content-utf8",
@@ -180,8 +185,14 @@ fn parse(bytes: &[u8]) -> Result<(LicenseContent, License), LicenseContentError>
         serde_json::from_value(value).map_err(|_| LicenseContentError::Schema)?;
     let content = match response {
         LicenseContentResponse::Success { license } => license,
-        LicenseContentResponse::SatisfactionFailure { .. } => {
-            return Err(LicenseContentError::NotEntitled);
+        LicenseContentResponse::SatisfactionFailure { satisfaction_failure } => {
+            // This is a licensing reason code, not an HTTP status. Never use
+            // provider text, remediation URLs or alternate content as guidance.
+            return Err(if satisfaction_failure.code == 501 {
+                LicenseContentError::DeviceLimit
+            } else {
+                LicenseContentError::NotEntitled
+            });
         }
     };
     // Preserve the first-key selection used by successful downloads.

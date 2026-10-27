@@ -7,6 +7,7 @@ pub mod license;
 pub mod login;
 pub mod logout;
 pub mod profile;
+pub mod social;
 pub mod game_activity;
 pub mod achievements;
 pub mod subscription;

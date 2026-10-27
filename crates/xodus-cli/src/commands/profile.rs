@@ -18,7 +18,7 @@ pub(super) async fn bounded(mut response: reqwest::Response, limit: usize) -> Re
     Ok(bytes)
 }
 
-fn picture_url(text: &str) -> Option<reqwest::Url> {
+pub(super) fn picture_url(text: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(text).ok()?;
     let host = url.host_str()?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() || url.port().is_some()

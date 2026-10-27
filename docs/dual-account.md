@@ -362,3 +362,15 @@ the patch). It builds this backend via **"Use dual-account backend"**, and
 6. Local saves created before switching to `play`: they are no longer
    visible (A7). This is expected, and the `play` cloud save
    takes over.
+
+## Nexus 0.3.12 recipe (linux-run-v54, merged 27.10.2026)
+
+Upstream added two account consumers; they are routed like the rest:
+
+| Location | Function | Role | Reason |
+|---|---|---|---|
+| `xodus-cli/src/commands/social.rs`, `social_session.rs` | `social --json` (Xbox friends, text chat) | **play** via `social --account play` (falls back to store) | Xbox social identity, like profile/achievements |
+| `xodus-service/src/connection/xml.rs` + `account_metadata.rs` | `MsaTokenRequest` → `XboxMsaAccountId` / `StoreMsaAccountId` | Xbox id from the **play** session that issued the ticket, Store id from the **store** session (`bound_ids_for_roles`) | Windows reports the Xbox app account and the Store account separately; they may differ. Upstream's change guard still applies (the play session is re-read after the exchange). With no play account, the result equals upstream's `bound_ids`. |
+
+`TokenManager::get_user_sts_session()` (upstream) is role-aware through
+`user_session()`, so it reads the play session on a play-scoped manager.

@@ -24,6 +24,40 @@ struct UserSession {
 
 pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
 
+#[cfg(test)]
+mod credential_account_metadata_tests {
+    use super::*;
+    #[test]
+    fn credential_account_metadata_snapshot_is_atomic_and_logout_removes_it() {
+        let manager = TokenManager::with_memory();
+        assert!(manager.get_user_sts_session().unwrap().is_none());
+        manager.save_user(&User { puid: "legacy".into(), username: "legacy".into() }).unwrap();
+        manager.save_user_token(PASSPORT_STS.into(), Token::Compact("legacy-token".into())).unwrap();
+        assert!(manager.get_user_sts_session().unwrap().is_none());
+        manager.save_user_session(User { puid: "0123456789abcdef".into(), username: "synthetic".into() },
+            HashMap::from([(PASSPORT_STS.into(), Token::Compact("synthetic-session-ticket".into()))])).unwrap();
+        let (user, token) = manager.get_user_sts_session().unwrap().unwrap();
+        assert_eq!(user.puid, "0123456789abcdef");
+        assert!(matches!(token, Token::Compact(value) if value == "synthetic-session-ticket"));
+        manager.remove_persistent().unwrap();
+        assert!(manager.get_user_sts_session().unwrap().is_none());
+    }
+    #[test]
+    fn credential_account_metadata_never_pairs_different_sessions_under_concurrent_reads() {
+        let manager = TokenManager::with_memory();
+        let save = |m: &TokenManager, name: &str| m.save_user_session(User { puid: name.into(), username: name.into() },
+            HashMap::from([(PASSPORT_STS.into(), Token::Compact(name.into()))])).unwrap();
+        save(&manager, "a");
+        let writer = manager.clone();
+        let thread = std::thread::spawn(move || for _ in 0..1000 { save(&writer, "b"); save(&writer, "a"); });
+        for _ in 0..10000 {
+            let (user, token) = manager.get_user_sts_session().unwrap().unwrap();
+            assert!(matches!(token, Token::Compact(value) if value == user.puid));
+        }
+        thread.join().unwrap();
+    }
+}
+
 /// Which Microsoft account a user operation targets. `Store` owns licenses and
 /// entitlements and keeps the historical keyring keys; `Play` is the identity a
 /// running game sees and uses the same keys under a `play/` prefix. Device
@@ -212,6 +246,14 @@ impl TokenManager {
     }
 
     // ---- User info -----------------------------------------------------------
+
+    /// An atomic authenticated user/token pair from the single session record.
+    /// Legacy independent entries are not sufficient for identity projection.
+    pub fn get_user_sts_session(&self) -> Result<Option<(User, Token)>, TokenStoreError> {
+        let Some(mut session) = self.user_session()? else { return Ok(None) };
+        let token = session.tokens.remove(PASSPORT_STS).ok_or(TokenStoreError::NotFound)?;
+        Ok(Some((session.user, token)))
+    }
 
     pub fn get_user(&self) -> Result<User, TokenStoreError> {
         if let Some(session) = self.user_session()? {

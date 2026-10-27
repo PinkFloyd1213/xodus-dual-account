@@ -6,7 +6,7 @@ use xodus::tokens::{AccountRole, TokenManager};
 
 use crate::webview;
 
-const CLIENT_ID: &str = "000000004424da1f";
+pub(super) const CLIENT_ID: &str = "000000004424da1f";
 const LOGIN_MARKET: &str = "en-US";
 const USER_AUTH_SCOPE: &str = "scope=service::user.auth.xboxlive.com::MBI_SSL&api-version=2.0";
 
