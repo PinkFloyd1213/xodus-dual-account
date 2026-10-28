@@ -129,6 +129,17 @@ async fn prepare_plain_launch_entry(
     Ok(Some((actual_name.clone(), inherit_launch_image(file, &actual_name)?)))
 }
 
+fn merge_plain_launch_files(files: &mut HashMap<String, SegmentFile>, plain: HashMap<String, SegmentFile>) {
+    let known: HashSet<String> = files.keys().map(|name| name.to_ascii_lowercase()).collect();
+    for (name, content) in plain {
+        // A plain-region read must never override an encrypted declaration or
+        // introduce another encrypted image through the supplemental path.
+        if !content.keep_encrypted && !known.contains(&name.to_ascii_lowercase()) {
+            files.insert(name, content);
+        }
+    }
+}
+
 fn wine_exit_code(status: std::process::ExitStatus) -> u8 {
     // A signal termination is not a successful game launch. Preserve the
     // conventional shell status (128 + signal) instead of reporting zero.
@@ -570,6 +581,12 @@ pub async fn run(
             }
         }
         lfiles.extend(sfiles);
+    } else if let Ok(plain) = xvd.parse_ntfs_segment_metadata(&mut file, true).await {
+        // Files in an unencrypted region (e.g. a plaintext launch executable)
+        // are absent from the encrypted segment metadata. Streaming installs
+        // them from the plain NTFS view; declare them here as plain images
+        // without replacing any encrypted declaration.
+        merge_plain_launch_files(&mut lfiles, plain);
     }
 
     let license = get_license(
@@ -973,6 +990,57 @@ mod tests {
         assert!(!nt.contains("synthetic-view\\Bin\\MINECRAFT.WINDOWS.EXE"));
         assert_eq!(std::fs::read(root.path().join("Bin/MINECRAFT.WINDOWS.EXE")).unwrap(), original);
         assert_eq!(std::fs::read(root.path().join("MicrosoftGame.config")).unwrap(), b"metadata unchanged");
+    }
+
+    #[tokio::test]
+    async fn plain_region_metadata_declares_selected_executable_without_replacing_encrypted_files() {
+        let root = tempfile::tempdir().unwrap();
+        let image = fake_pe();
+        std::fs::write(root.path().join("Minecraft.Windows.exe"), &image).unwrap();
+        let file = |encrypted| SegmentFile { offset: 37, length: image.len() as u64,
+            data_hashs: vec![], keep_encrypted: encrypted };
+        let mut files = HashMap::from([("Encrypted.dll".into(), file(true))]);
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Minecraft.Windows.exe")).await.unwrap().is_none());
+        merge_plain_launch_files(&mut files, HashMap::from([
+            ("Minecraft.Windows.exe".into(), file(false)),
+            ("ENCRYPTED.DLL".into(), file(false)),
+            ("UnexpectedEncrypted.dll".into(), file(true)),
+        ]));
+        assert_eq!(files.len(), 2);
+        assert!(files["Encrypted.dll"].keep_encrypted);
+        assert!(!files.contains_key("ENCRYPTED.DLL"));
+        assert!(!files.contains_key("UnexpectedEncrypted.dll"));
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("minecraft.windows.exe")).await.unwrap().is_some());
+        assert!(prepare_plain_launch_entry(root.path(), &files, None).await.unwrap().is_none());
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Unlisted.exe")).await.unwrap().is_none());
+        assert_eq!(std::fs::read(root.path().join("Minecraft.Windows.exe")).unwrap(), image);
+    }
+
+    #[test]
+    fn plain_region_metadata_empty_read_preserves_all_existing_declarations() {
+        let original = SegmentFile { offset: 123, length: 4096, data_hashs: vec![[7;20]], keep_encrypted: true };
+        let mut files = HashMap::from([("Game.exe".into(), original)]);
+        merge_plain_launch_files(&mut files, HashMap::new());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["Game.exe"].offset, 123);
+        assert_eq!(files["Game.exe"].data_hashs, vec![[7;20]]);
+        assert!(files["Game.exe"].keep_encrypted);
+    }
+
+    #[tokio::test]
+    async fn plain_region_metadata_keeps_path_signature_and_ambiguity_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let image = fake_pe();
+        std::fs::write(root.path().join("Game.exe"), &image).unwrap();
+        let file = || SegmentFile { offset: 0, length: image.len() as u64, data_hashs: vec![], keep_encrypted: false };
+        let mut files = HashMap::new();
+        merge_plain_launch_files(&mut files, HashMap::from([
+            ("Game.exe".into(), file()), ("GAME.EXE".into(), file()), ("../outside.exe".into(), file()),
+        ]));
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("game.exe")).await.is_err());
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("../outside.exe")).await.is_err());
+        std::fs::write(root.path().join("Game.exe"), vec![0;image.len()]).unwrap();
+        assert!(prepare_plain_launch_entry(root.path(), &files, Some("Game.exe")).await.is_err());
     }
 
     #[test]
