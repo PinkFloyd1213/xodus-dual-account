@@ -18,13 +18,16 @@ use tempfile::{tempdir, tempfile, tempfile_in};
 use tokio::fs::{File, OpenOptions};
 use tokio::process::Command;
 use xodus::models::secrets::Token;
-use xodus::tokens::TokenManager;
+use xodus::tokens::{AccountRole, TokenManager};
 
 use crate::license::get_license;
 
 const PLAYFAB_RELYING_PARTY: &str = "http://playfab.xboxlive.com/";
 
 async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) -> Option<String> {
+    // PlayFab identifies the player: use the play account, falling back to store.
+    let tokens = tokens.resolve(AccountRole::Play).ok()?;
+    tracing::info!(role = tokens.role().as_str(), "Requesting PlayFab XSTS");
     let Ok(Token::Legacy(dev_token)) = tokens.get_device_sts_token() else {
         return None;
     };
