@@ -374,3 +374,10 @@ Upstream added two account consumers; they are routed like the rest:
 
 `TokenManager::get_user_sts_session()` (upstream) is role-aware through
 `user_session()`, so it reads the play session on a play-scoped manager.
+
+## Nexus sync 28.10.2026 (no routing change)
+
+The new upstream patches (plain-region launch metadata in `run`, device
+registration response validation, Xbox delegation ticket `t=`/`d=` prefix,
+SISU response validation) add **no** new consumer of the user account. The
+`do_sisu` change keeps its single existing store-only write. The map is unchanged.
