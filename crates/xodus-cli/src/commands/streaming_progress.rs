@@ -95,11 +95,16 @@ struct State {
     phase: &'static str,
     paused: bool,
     files: HashMap<usize, (u64, u64)>,
+    traffic: Option<(u64,u64)>,
 }
 
 impl State {
     fn apply(&mut self, event: ProgressEvent) -> bool {
         match event {
+            ProgressEvent::Traffic { network, reused } => {
+                let traffic=self.traffic.get_or_insert((0,0));
+                traffic.0=traffic.0.saturating_add(network); traffic.1=traffic.1.saturating_add(reused);
+            }
             ProgressEvent::Started { id, total, .. } => {
                 self.files.insert(id, (0, total));
             }
@@ -145,13 +150,17 @@ impl State {
     }
 
     fn record(&self, sequence: u64, rate: u64) -> serde_json::Value {
-        serde_json::json!({
+        let mut value=serde_json::json!({
             "schema": 1, "event": "progress", "sequence": sequence,
             "phase": self.phase, "paused": self.paused,
             "canPause": self.phase == "downloading",
             "completedBytes": self.completed, "totalBytes": self.total,
             "bytesPerSecond": rate,
-        })
+        });
+        if let Some((network,reused))=self.traffic {
+            value["networkBytes"]=network.into(); value["reusedBytes"]=reused.into();
+        }
+        value
     }
 }
 

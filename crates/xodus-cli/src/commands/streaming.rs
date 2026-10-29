@@ -23,6 +23,8 @@ mod progress;
 mod resume;
 #[path = "streaming_failure.rs"]
 mod failure;
+#[path = "streaming_update.rs"]
+mod update;
 
 #[cfg(test)]
 #[path = "streaming_preflight_tests.rs"]
@@ -68,6 +70,7 @@ enum ProgressEvent {
     UpdateStatus { name: String },
     Paused { paused: bool },
     Completed { success: bool },
+    Traffic { network: u64, reused: u64 },
 }
 
 pub async fn run(
@@ -271,7 +274,7 @@ where
                 ProgressEvent::UpdateStatus { name } => {
                     total_progess.set_message(name);
                 }
-                ProgressEvent::Paused { .. } => {}
+                ProgressEvent::Paused { .. } | ProgressEvent::Traffic { .. } => {}
                 ProgressEvent::Completed { .. } => break,
             }
         }
@@ -425,6 +428,9 @@ where
         tokens,
         remote_xvd.content_id().to_string(),
         market.unwrap_or("neutral".to_string()),
+        // Downloads stay online-only; offline licenses are for launching installed games.
+        None,
+        false,
     )
     .await;
     if let Err(err) = license {
@@ -448,27 +454,51 @@ where
         Err(_) => { eprintln!("The content key could not be authenticated. Retry the installation or sign in again."); return ExitCode::FAILURE; }
     };
 
-    let pending = match pending_files(out, &rfiles, &lfiles) {
+    let recovering = match crate::installation_state::incomplete(out) {
+        Ok(value) => value,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let mut pending = match update::pending(out, &rfiles, &lfiles, recovering) {
         Ok(files) => files,
         Err(error) => { eprintln!("Unable to inspect installed package files: {error}"); return ExitCode::FAILURE; }
     };
-    let total_size: u64 = pending
-        .iter()
-        .map(|(_, v)| v.length)
-        .sum();
-
-    let journal = match resume::Journal::open(out, &remote_xvd.resume_identity(), &rfiles) {
+    let identity = match resume::Journal::identity(&remote_xvd.resume_identity(), &rfiles) {
+        Ok(identity) => identity,
+        Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+    };
+    let installed_journal = match resume::Journal::open_with_identity(out, &identity) {
         Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
-        Err(error) => {
-            eprintln!("Unable to prepare download checkpoints: {error}");
-            return ExitCode::FAILURE;
+        Err(error) => { eprintln!("Unable to prepare download checkpoints: {error}"); return ExitCode::FAILURE; }
+    };
+    let stage = if !final_path.exists() && !recovering { None } else {
+        match update::staging(out) {
+            Ok(stage) => Some(stage),
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
         }
     };
-    let saved: u64 = pending
-        .iter()
-        .map(|(name, file)| journal.lock().unwrap().offset(name, file.length))
-        .sum();
-    let required_free_space = total_size.saturating_sub(saved);
+    if stage.is_some() {
+        pending.retain(|(name,file)| !update::completed(&installed_journal.lock().unwrap(),out,name,file));
+    }
+    let journal = match &stage {
+        Some(stage) => match resume::Journal::open_with_identity(stage, &identity) {
+            Ok(journal) => std::sync::Arc::new(std::sync::Mutex::new(journal)),
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        },
+        None => installed_journal.clone(),
+    };
+    let total_size: u64 = pending.iter().map(|(_,file)|file.length).sum();
+    let saved: u64 = pending.iter().map(|(name,file)| journal.lock().unwrap().offset(name,file.length)).sum();
+    let required_free_space = match &stage {
+        Some(_) => match update::required_space(out,pending.iter().copied(),&journal.lock().unwrap()) {
+            Ok(size) => size,
+            Err(error) => { failure::report(&error); return ExitCode::FAILURE; }
+        },
+        None => total_size.saturating_sub(saved),
+    };
+    if stage.is_some() {
+        eprintln!("Update plan: {} bytes in changed files; {} bytes of extra disk space. Files are staged one at a time; verified local pages are reused, only gaps are downloaded.",total_size,required_free_space);
+        tx.send(ProgressEvent::Traffic {network:0,reused:0}).await.ok();
+    }
     let available_free_space = match available_space(out) {
         Ok(space) => space,
         Err(err) => {
@@ -492,6 +522,11 @@ where
         return ExitCode::FAILURE;
     }
 
+    if stage.is_some() {
+        if let Err(error) = update::begin(out, &rfiles, &pending) {
+            failure::report(&error); return ExitCode::FAILURE;
+        }
+    }
     tx.send(ProgressEvent::UpdateRemaining {
         name: "Downloading".to_owned(),
         total: total_size,
@@ -515,11 +550,15 @@ where
             })
             .enumerate(),
     )
-    .for_each_concurrent(parallel.unwrap_or(4).max(1), |(id, job)| {
+    .for_each_concurrent(if stage.is_some() { 1 } else { parallel.unwrap_or(4).max(1) }, |(id, job)| {
         let tx = tx.clone();
         let client = client.clone();
         let mut pause = pause.clone();
         let journal = journal.clone();
+        let installed_journal = installed_journal.clone();
+        let stage = stage.as_deref();
+        let old = lfiles.get(&job.name);
+        let full_content = &rfiles[&job.name];
         let failed = failed.clone();
         let failure_signal = failure_signal.clone();
         async move {
@@ -530,7 +569,7 @@ where
             };
             if failure::run_or_cancel(failure_signal.clone(), prepared).await.is_err() { return; }
             let opened = async {
-                let target_file = resume::target(out, &job.name)?;
+                let target_file = match stage { Some(stage)=>update::output(stage,&job.name)?, None=>resume::target(out,&job.name)? };
                 if let Some(folder) = target_file.parent() { std::fs::create_dir_all(folder)?; }
                 Ok::<_,failure::Error>(OpenOptions::new().create(true).write(true).truncate(false).open(&target_file).await?)
             }.await;
@@ -586,7 +625,11 @@ where
                 .unwrap()
                 .checkpoint(&job.name, offset)?;
 
-            if let Some(fpath) = url.strip_prefix("file://") {
+            if stage.is_some() && !url.starts_with("file://") {
+                update::transfer(remote_xvd_ref,&client,url,&resume::target(out,&job.name)?,old,
+                    full_content,&mut fout,*full_key,offset,pause.clone(),parallel.unwrap_or(4),&tx,id,
+                    |synced|journal.lock().unwrap().checkpoint_synced(&job.name,synced)).await?;
+            } else if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await?;
                 remote_xvd_ref
                     .extract_file(&mut i, &mut fout, &job.content, *full_key, progress)
@@ -610,6 +653,13 @@ where
             };
             let result = failure::run_or_cancel(failure_signal, operation).await;
             let result = failure::settle(&mut fout, result, || journal.lock().unwrap().checkpoint(&job.name,job.content.length)).await;
+            let result = result.and_then(|()| {
+                if let Some(stage) = stage {
+                    update::commit(stage,out,&job.name)?;
+                    installed_journal.lock().unwrap().checkpoint(&job.name,job.content.length)?;
+                }
+                Ok(())
+            });
             match result {
                 Ok(()) => { tx.send(ProgressEvent::Finished { id }).await.ok(); }
                 Err(error) => { if !failed.send_replace(true) { failure::report(error.as_ref()); } }
@@ -624,7 +674,7 @@ where
     })
     .await
     .ok();
-    if let Err(error) = failure::finalize(&cache_path, &final_path, false) {
+    if let Err(error) = crate::installation_state::finish(out, &cache_path, &final_path) {
         failure::report(&error);
         return ExitCode::FAILURE;
     }

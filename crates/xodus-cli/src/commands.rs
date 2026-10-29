@@ -5,6 +5,7 @@ pub mod extract_eappx;
 pub mod license;
 pub mod login;
 pub mod logout;
+pub mod offline_pc;
 pub mod profile;
 pub mod social;
 pub mod game_activity;
@@ -16,3 +17,6 @@ pub mod library;
 pub mod run;
 pub mod splicense;
 pub mod streaming;
+
+pub mod native_social;
+pub mod native_social_party;

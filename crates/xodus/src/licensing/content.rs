@@ -12,7 +12,7 @@ use crate::models::licensing::{
 
 #[path = "content_response.rs"]
 mod response;
-pub use response::LicenseContentError;
+pub use response::{LeasePolicy, LicenseContentError, lease_policy, parse_lease};
 
 // we might need a bump in xal-rs concerning reqwest,
 // that might block us from using the correlationvector extension
