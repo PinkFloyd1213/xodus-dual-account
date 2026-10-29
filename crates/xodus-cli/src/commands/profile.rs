@@ -19,6 +19,7 @@ pub(super) async fn bounded(mut response: reqwest::Response, limit: usize) -> Re
 }
 
 pub(super) fn picture_url(text: &str) -> Option<reqwest::Url> {
+    if text.len()>8192{return None;}
     let url = reqwest::Url::parse(text).ok()?;
     let host = url.host_str()?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() || url.port().is_some()
@@ -47,11 +48,45 @@ fn image_data(bytes: &[u8]) -> Option<String> {
 }
 
 pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Client, String, String), &'static str> {
+    let (client, authorization, account, _) = xbox_session_identity(tokens).await?;
+    Ok((client, authorization, account))
+}
+
+pub(super) async fn xbox_session_identity(tokens: &TokenManager) -> Result<(reqwest::Client, String, String, Option<String>), &'static str> {
+    xbox_session_for(tokens, "http://xboxlive.com").await
+}
+
+fn auth_failure(stage:&'static str,error:reqwest::Error)->&'static str{
+    if let Some(status)=error.status(){eprintln!("NEXUS_SOCIAL_AUTH_DIAGNOSTIC_V1 {stage} status {}",status.as_u16());}
+    else {let class=if error.is_timeout(){"timeout"}else if error.is_connect(){"connect"}else if error.is_decode(){"decode"}else{"request"};
+        eprintln!("NEXUS_SOCIAL_AUTH_DIAGNOSTIC_V1 {stage} {class}");}
+    stage
+}
+
+fn social_cache_key(account:&str,user:&xodus::models::secrets::LegacyToken,audience:&str)->Result<String,&'static str>{
+    use std::hash::{Hash,Hasher};
+    let mut hash=std::collections::hash_map::DefaultHasher::new();
+    account.hash(&mut hash);audience.hash(&mut hash);serde_json::to_vec(user).map_err(|_|"session-cache-key")?.hash(&mut hash);
+    Ok(format!("nexus-social-bearer:{:016x}",hash.finish()))
+}
+pub(super) fn invalidate_social_session(tokens:&TokenManager){
+    let Ok(account)=tokens.get_user()else{return};
+    let Ok(Token::Legacy(user))=tokens.get_user_sts_token()else{return};
+    for audience in ["http://xboxlive.com","http://gssv.xboxlive.com/"]{
+        if let Ok(key)=social_cache_key(&account.username,&user,audience){tokens.remove_cached_xsts(&key);}
+    }
+}
+
+pub(super) async fn xbox_session_for(tokens: &TokenManager, audience: &str) -> Result<(reqwest::Client, String, String, Option<String>), &'static str> {
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
         .timeout(super::session::REQUEST_TIMEOUT).user_agent("xodus-nexus-profile/1").build().map_err(|_| "http-client")?;
     let (account, device, user) = super::session::prepare(tokens, &client).await.map_err(|stage| {
         super::session::diagnostic(stage); stage
     })?;
+    let cache_key=social_cache_key(&account,&user,audience)?;
+    let cached=tokens.get_cached_xsts(&cache_key).filter(|t|t.not_after>chrono::Utc::now()+chrono::Duration::seconds(60));
+    if std::env::var_os("NEXUS_SOCIAL_TRACE_CACHE").is_some(){eprintln!("NEXUS_SOCIAL_CACHE_DIAGNOSTIC_V1 {}",if cached.is_some(){"hit"}else{"miss"});}
+    let xsts=if let Some(token)=cached{token}else{
     // Reuse the upstream RPS -> Xbox user -> XSTS exchange. This is a bearer
     // user token (no ProofKey); it must not use the runtime's PoP-bound token.
     let outcome = super::session::exchange(|| async { xodus::api::live::exchange_user_token(&client, user.clone(), account.clone(), device.clone(),
@@ -65,17 +100,21 @@ pub(super) async fn xbox_session(tokens: &TokenManager) -> Result<(reqwest::Clie
         _ => return Err("msa-response"),
     };
     let Token::Compact(ticket) = token else { return Err("msa-ticket"); };
-    let user = xodus::api::xbox::authenticate_xbox_user(&client, ticket).await.map_err(|_| "xbox-user")?;
-    let xsts = xodus::api::xbox::request_xsts_token(&client, user.token, "http://xboxlive.com").await.map_err(|_| "xsts")?;
+    let user = xodus::api::xbox::authenticate_xbox_user(&client, ticket).await.map_err(|e|auth_failure("xbox-user",e))?;
+    let xsts = xodus::api::xbox::request_xsts_token(&client, user.token, audience).await.map_err(|e|auth_failure("xsts",e))?;
+    if xsts.user_hash().is_none_or(str::is_empty){return Err("xsts-claim");}
+    tokens.cache_xsts(&cache_key,&xsts);xsts};
     let uhs = xsts.user_hash().ok_or("xsts-claim")?;
+    let identity = xsts.user_id().map(str::to_owned);
     let authorization = format!("XBL3.0 x={uhs};{}", xsts.token);
-    Ok((client, authorization, account))
+    Ok((client, authorization, account, identity))
 }
 
 async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
     let (client, authorization, account) = xbox_session(tokens).await?;
     let response = client.get(PROFILE).header("Authorization", authorization)
         .header("x-xbl-contract-version", "2").send().await.map_err(|_| "profile-request")?;
+    if response.status().as_u16()==401{invalidate_social_session(tokens);}
     let body = bounded(response, 128 * 1024).await?;
     let (gamertag, picture) = fields(&serde_json::from_slice(&body).map_err(|_| "profile-json")?)?;
     // Fresh request, no Authorization/Signature or redirects to the image CDN.
@@ -117,6 +156,19 @@ pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn social_memory_cache_is_separate_for_accounts_sessions_and_audiences_and_can_be_invalidated(){
+        let mut user=xodus::models::secrets::LegacyToken{key_name:None,token:"synthetic-credential".into(),binary_secret:None,tpm_key:None,
+            lifetime:soap::Timestamp{id:None,created:"2026-01-01T00:00:00Z".into(),expires:"2099-01-01T00:00:00Z".into()}};
+        let first=social_cache_key("first-account",&user,"http://xboxlive.com").unwrap();
+        assert_ne!(first,social_cache_key("second-account",&user,"http://xboxlive.com").unwrap());
+        assert_ne!(first,social_cache_key("first-account",&user,"http://gssv.xboxlive.com/").unwrap());
+        user.token="new-synthetic-session".into();assert_ne!(first,social_cache_key("first-account",&user,"http://xboxlive.com").unwrap());
+        assert!(!first.contains("credential"));
+        let tokens=TokenManager::with_memory();
+        let value:xodus::models::xbox::XstsResponse=serde_json::from_value(json!({"NotAfter":"2099-01-01T00:00:00Z","Token":"synthetic-token","DisplayClaims":{"xui":[{"uhs":"hash","xid":"1"}]}})).unwrap();
+        tokens.cache_xsts(&first,&value);assert!(tokens.get_cached_xsts(&first).is_some());
+        tokens.remove_cached_xsts(&first);assert!(tokens.get_cached_xsts(&first).is_none());
+    }
     #[test]
     fn profile_settings_are_validated_without_exposing_other_fields() {
         let value = json!({"profileUsers":[{"id":"private-id", "settings":[

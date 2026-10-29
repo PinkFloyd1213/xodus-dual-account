@@ -47,8 +47,29 @@ fn streaming_stored_length_distinguishes_plain_and_ciphertext_and_rejects_overfl
 }
 
 #[tokio::test]
+async fn streaming_throughput_decrypts_large_batches_with_exact_unpadded_plaintext() {
+    let (xvd, mut file, key, plain, ciphertext) = fixture(1024 * 1024 + 107);
+    file.keep_encrypted = false;
+    let stored = ciphertext.len();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); }
+        socket.write_all(format!("HTTP/1.1 206 Test\r\nContent-Length: {stored}\r\nContent-Range: bytes 0-{}/{stored}\r\nConnection: close\r\n\r\n",stored-1).as_bytes()).await.unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+    });
+    let mut output = Vec::new();
+    xvd.download_file_http(&reqwest::Client::new(), &format!("http://{address}/fixture"),
+        &mut output,&file,key,|_,_|{},None,0,|_|Ok(())).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(output, plain);
+}
+
+#[tokio::test]
 async fn streaming_encrypted_download_and_partial_resume_keep_exact_ciphertext_for_launch_decryption() {
-    for length in [1u64, 4095, 4096, 4097, 5000, 8192, 8193] {
+    for length in [1u64, 4095, 4096, 4097, 5000, 8192, 8193, 1024 * 1024 + 107] {
         for initial in [0u64, 4096].into_iter().filter(|&n| n < length) {
             let (xvd, content, key, plain, ciphertext) = fixture(length);
             let stored = ciphertext.len();
@@ -106,4 +127,20 @@ async fn streaming_plain_output_remains_unpadded_and_short_ciphertext_returns_er
     server.await.unwrap();
     assert_eq!(downloaded.len(),5000);
     assert_eq!(downloaded,plain);
+}
+
+#[test]
+fn streaming_update_verifier_checks_licensed_plaintext_ciphertext_wrong_keys_and_modified_pages() {
+    use sha2::{Digest,Sha256};
+    let (xvd,mut content,key,plain,ciphertext)=fixture(8192);
+    content.data_hashs=ciphertext.chunks_exact(PAGE_SIZE).map(|p|Sha256::digest(p)[..20].try_into().unwrap()).collect();
+    assert!(xvd.stored_page_verifier(&content,key).matches(0,ciphertext[..PAGE_SIZE].try_into().unwrap()));
+    content.keep_encrypted=false;
+    let page: &[u8;PAGE_SIZE]=plain[..PAGE_SIZE].try_into().unwrap();
+    assert!(xvd.stored_page_verifier(&content,key).matches(0,page));
+    assert!(!xvd.stored_page_verifier(&content,[0;32]).matches(0,page));
+    let mut corrupt=*page;corrupt[200]^=1;
+    assert!(!xvd.stored_page_verifier(&content,key).matches(0,&corrupt));
+    assert!(!xvd.stored_page_verifier(&content,key).matches(1,page));
+    assert!(!xvd.stored_page_verifier(&content,key).matches(2,page));
 }

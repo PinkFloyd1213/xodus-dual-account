@@ -13,7 +13,7 @@ pub async fn run(
     market: String,
     ciks: String,
 ) -> ExitCode {
-    let license = get_license(client, tokens, content_id, market).await;
+    let license = get_license(client, tokens, content_id, market, None, false).await;
     if let Err(err) = license {
         eprintln!("{}", err);
         return ExitCode::FAILURE;

@@ -313,6 +313,8 @@ impl TokenManager {
         self.cache_xsts_response(relying_party, token);
     }
 
+    pub fn remove_cached_xsts(&self,key:&str){let _=self.ephemeral.remove(key);}
+
     fn cache_xsts_response(&self, key: &str, token: &XstsResponse) {
         let Ok(bytes) = serde_json::to_vec(token) else {
             return;

@@ -1,6 +1,8 @@
 //! Settles active writes before a failed batch releases its installation lock.
 use msixvc::streaming_http::TransferError;
-use std::{future::Future, path::Path};
+use std::future::Future;
+#[cfg(test)]
+use std::path::Path;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     sync::watch,
@@ -50,6 +52,7 @@ fn report_as(mut error: &(dyn std::error::Error + 'static), stage: &'static str)
     eprintln!("{}", error.diagnostic());
     eprintln!("{error} Retry this installation to obtain a fresh package link and resume safely.");
 }
+#[cfg(test)]
 pub(super) fn finalize(cache: &Path, final_path: &Path, failed: bool) -> std::io::Result<bool> {
     if failed {
         return Ok(false);

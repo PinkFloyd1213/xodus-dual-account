@@ -131,7 +131,7 @@ pub struct DeviceAddResponse {
     pub server_info: ServerInfo,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct License {
     #[serde(rename = "SPLicenseBlock")]
@@ -141,7 +141,7 @@ pub struct License {
     pub binding: Binding,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct LicenseInfo {
     #[serde(rename = "@Type")]
@@ -153,9 +153,11 @@ pub struct LicenseInfo {
     pub issued_date: Option<String>,
     pub last_updated_date: Option<String>,
     pub begin_date: Option<String>,
+    /// Present on lease licenses.
+    pub expiration_date: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub struct Binding {
     #[serde(rename = "@Binding_Type")]
@@ -170,18 +172,23 @@ pub struct Binding {
     #[serde(rename = "USID")]
     pub usid: Option<String>,
     pub lease_required: Option<String>,
+    /// Lease licenses: renewal period in minutes.
+    pub lease_renewal_period: Option<String>,
+    #[serde(rename = "AssociatedPFNs")]
+    pub associated_pfns: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum LicenseType {
     Device,
     User,
     Full,
     KeyHolder,
+    Lease,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum LicenseUsage {
     Online,

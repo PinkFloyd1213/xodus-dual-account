@@ -108,3 +108,12 @@ async fn streaming_metadata_failure_returns_error_without_panic_or_touching_exis
         server.await.unwrap();
     }
 }
+
+#[test]
+fn streaming_update_preserves_uninstalled_optional_archive_placeholders() {
+    let root=tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("optional.ucas"),[]).unwrap();
+    let files=HashMap::from([("optional.ucas".to_owned(),SegmentFile{offset:0,length:8192,keep_encrypted:false,data_hashs:vec![[7;20];2]})]);
+    assert!(pending_files(root.path(),&files,&files).unwrap().is_empty());
+    assert_eq!(std::fs::metadata(root.path().join("optional.ucas")).unwrap().len(),0);
+}

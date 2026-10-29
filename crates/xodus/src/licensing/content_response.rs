@@ -212,6 +212,55 @@ fn parse(bytes: &[u8]) -> Result<(LicenseContent, License), LicenseContentError>
     Ok((content, license))
 }
 
+/// Parses one lease document from the content response (base64 XML), with
+/// the same bounds and fixed errors as the key license.
+pub fn parse_lease(value: &str) -> Result<License, LicenseContentError> {
+    if value.is_empty() || value.len() > MAX_BODY {
+        return Err(LicenseContentError::EmptyKeys);
+    }
+    let xml = BASE64_STANDARD
+        .decode(value)
+        .map_err(|_| LicenseContentError::Base64)?;
+    let xml = std::str::from_utf8(&xml).map_err(|_| LicenseContentError::Utf8)?;
+    quick_xml::de::from_str(xml).map_err(|_| LicenseContentError::Xml)
+}
+
+/// The policy Microsoft attaches to a lease (`CustomPolicies`, base64 JSON).
+/// Only the fields Nexus acts on are read; unknown fields are ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasePolicy {
+    /// Microsoft marks leases issued to the account's designated offline device.
+    pub is_offline: bool,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub poll_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub lease_enforcement: Option<String>,
+}
+
+pub fn lease_policy(lease: &License) -> Option<LeasePolicy> {
+    let encoded = lease.custom_policies.as_deref()?;
+    if encoded.len() > 64 * 1024 {
+        return None;
+    }
+    let json = BASE64_STANDARD.decode(encoded).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    let time = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+            .map(|time| time.with_timezone(&chrono::Utc))
+    };
+    Some(LeasePolicy {
+        is_offline: value.get("isOffline").and_then(serde_json::Value::as_bool) == Some(true),
+        expires_at: time("expiresAt"),
+        poll_at: time("pollAt"),
+        lease_enforcement: value
+            .get("leaseEnforcement")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
 #[cfg(test)]
 #[path = "content_response_tests.rs"]
 mod tests;

@@ -14,6 +14,33 @@ pub(super) struct Journal {
     entries: serde_json::Map<String, serde_json::Value>,
 }
 
+pub(super) struct Identity(String);
+
+/// A data sync completed on this exact output inode before its journal entry.
+/// Fields are private so callers cannot claim that unsynced bytes are durable.
+pub(super) struct SyncedCheckpoint {
+    offset: u64,
+    device: u64,
+    inode: u64,
+}
+
+impl SyncedCheckpoint {
+    #[cfg(test)]
+    pub(super) fn position(&self) -> u64 { self.offset }
+}
+
+pub(super) async fn sync_output(file: &mut tokio::fs::File, offset: u64) -> io::Result<SyncedCheckpoint> {
+    use std::os::unix::fs::MetadataExt;
+    use tokio::io::AsyncWriteExt;
+    file.flush().await?;
+    file.sync_data().await?;
+    let meta = file.metadata().await?;
+    if !meta.is_file() || meta.len() < offset {
+        return Err(io::Error::other("checkpoint output is incomplete"));
+    }
+    Ok(SyncedCheckpoint { offset, device:meta.dev(), inode:meta.ino() })
+}
+
 /// Preserve completed ciphertext pages, trim only uncommitted data. Return the
 /// logical offset to resume from, which can rewind an old truncated final page.
 pub(super) async fn prepare_output(
@@ -209,17 +236,35 @@ pub(super) fn target(root: &Path, name: &str) -> io::Result<PathBuf> {
 }
 
 impl Journal {
-    pub(super) fn open(
-        root: &Path,
+    pub(super) fn identity(
         content: &str,
         files: &HashMap<String, SegmentFile>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Identity> {
         let mut layout: Vec<_> = files
             .iter()
             .map(|(name, f)| (name, f.offset, f.length, f.keep_encrypted, &f.data_hashs))
             .collect();
         layout.sort_by(|a, b| a.0.cmp(b.0));
-        let identity = resume_digest(&serde_json::to_vec(&(content, layout))?);
+        let mut digest = msixvc::streaming::ResumeDigest::default();
+        {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut digest);
+            serde_json::to_writer(&mut writer, &(content, layout))?;
+            writer.flush()?;
+        }
+        Ok(Identity(digest.finish()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn open(
+        root: &Path,
+        content: &str,
+        files: &HashMap<String, SegmentFile>,
+    ) -> io::Result<Self> {
+        Self::open_with_identity(root, &Self::identity(content, files)?)
+    }
+
+    pub(super) fn open_with_identity(root: &Path, identity: &Identity) -> io::Result<Self> {
+        let identity = identity.0.clone();
         let path = target(root, ".nexus-streaming-v1.jsonl")?;
         let mut entries = serde_json::Map::new();
         if let Ok(file) = File::open(&path) {
@@ -270,6 +315,20 @@ impl Journal {
         let file = target(&self.root, name)?;
         // File data reaches storage before the journal claims it can be resumed.
         File::open(&file)?.sync_data()?;
+        self.append_checkpoint(name, &file, offset)
+    }
+
+    pub(super) fn checkpoint_synced(&mut self, name: &str, synced: SyncedCheckpoint) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let file = target(&self.root, name)?;
+        let meta = fs::metadata(&file)?;
+        if !meta.is_file() || meta.dev() != synced.device || meta.ino() != synced.inode || meta.len() < synced.offset {
+            return Err(io::Error::other("checkpoint output changed after data sync"));
+        }
+        self.append_checkpoint(name, &file, synced.offset)
+    }
+
+    fn append_checkpoint(&mut self, name: &str, file: &Path, offset: u64) -> io::Result<()> {
         let digest = tail(&file, offset)?;
         let entry = serde_json::json!({"offset": offset, "tailSha256": digest});
         let path = target(&self.root, ".nexus-streaming-v1.jsonl")?;
@@ -326,6 +385,95 @@ fn tail(path: &Path, offset: u64) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streaming_resume_synced_proof_binds_exact_output_and_preserves_legacy_journal() {
+        use tokio::io::AsyncWriteExt;
+        let root=tempfile::tempdir().unwrap();
+        let files=HashMap::from([("a".to_owned(),SegmentFile {offset:0,length:8192,keep_encrypted:false,data_hashs:vec![]})]);
+        let mut journal=Journal::open(root.path(),"proof",&files).unwrap();
+        fs::write(root.path().join("b"),vec![19;8192]).unwrap();
+        let mut out=tokio::fs::File::create(root.path().join("a")).await.unwrap();
+        out.write_all(&vec![19;8192]).await.unwrap();
+        let wrong=sync_output(&mut out,4096).await.unwrap();
+        assert!(journal.checkpoint_synced("b",wrong).is_err());
+        assert_eq!(journal.offset("b",8192),0);
+        let proof=sync_output(&mut out,4096).await.unwrap();
+        journal.checkpoint_synced("a",proof).unwrap();drop(journal);
+        let mut journal=Journal::open(root.path(),"proof",&files).unwrap();
+        assert_eq!(journal.offset("a",8192),4096);
+        let replaced=sync_output(&mut out,8192).await.unwrap();
+        fs::rename(root.path().join("a"),root.path().join("old-a")).unwrap();
+        fs::write(root.path().join("a"),vec![19;8192]).unwrap();
+        assert!(journal.checkpoint_synced("a",replaced).is_err(),"same bytes on another inode are not a data-sync proof");
+        out.set_len(1024).await.unwrap();
+        assert!(sync_output(&mut out,4096).await.is_err());
+    }
+    fn legacy_identity(content: &str, files: &HashMap<String, SegmentFile>) -> String {
+        let mut layout: Vec<_> = files.iter()
+            .map(|(name, f)| (name, f.offset, f.length, f.keep_encrypted, &f.data_hashs)).collect();
+        layout.sort_by(|a, b| a.0.cmp(b.0));
+        resume_digest(&serde_json::to_vec(&(content, layout)).unwrap())
+    }
+
+    #[test]
+    fn streaming_resume_streamed_identity_is_byte_compatible_and_binds_every_layout_field() {
+        let mut files = HashMap::from([
+            ("žluťoučký/🎮\\\"\n.bin".to_owned(), SegmentFile {
+                offset: u64::MAX - 100, length: 5000, keep_encrypted: true,
+                data_hashs: (0..256).map(|n| [n as u8; 20]).collect(),
+            }),
+            ("a".to_owned(), SegmentFile { offset: 0, length: 0, keep_encrypted: false, data_hashs: vec![] }),
+        ]);
+        let identity = Journal::identity("package\n\"", &files).unwrap().0;
+        assert_eq!(identity, legacy_identity("package\n\"", &files));
+        assert_eq!(Journal::identity("empty", &HashMap::new()).unwrap().0, legacy_identity("empty", &HashMap::new()));
+        assert_ne!(Journal::identity("another", &files).unwrap().0, identity);
+        for field in 0..4 {
+            let file = files.get_mut("a").unwrap();
+            *file = SegmentFile { offset: 0, length: 0, keep_encrypted: false, data_hashs: vec![] };
+            match field { 0 => file.offset = 1, 1 => file.length = 1,
+                2 => file.keep_encrypted = true, _ => file.data_hashs.push([7;20]) }
+            assert_ne!(Journal::identity("package\n\"", &files).unwrap().0, identity);
+        }
+    }
+
+    #[test]
+    fn streaming_resume_shared_identity_reopens_legacy_checkpoints_in_both_roots() {
+        let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let files = HashMap::from([("a.bin".to_owned(), SegmentFile {
+            offset: 4096, length: 8192, keep_encrypted: false, data_hashs: vec![[3;20];2],
+        })]);
+        let identity = Journal::identity("package", &files).unwrap();
+        for root in roots {
+            let path = root.path().join("a.bin");
+            fs::write(&path, vec![19;8192]).unwrap();
+            let record = serde_json::json!({"schema":1,"identity":legacy_identity("package",&files),
+                "file":"a.bin","checkpoint":{"offset":4096,"tailSha256":tail(&path,4096).unwrap()}});
+            fs::write(root.path().join(".nexus-streaming-v1.jsonl"), format!("{record}\n")).unwrap();
+            let journal = Journal::open_with_identity(root.path(), &identity).unwrap();
+            assert_eq!(journal.offset("a.bin",8192),4096);
+            let other = Journal::identity("changed", &files).unwrap();
+            assert_eq!(Journal::open_with_identity(root.path(), &other).unwrap().offset("a.bin",8192),0);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic identity CPU benchmark, no account or installed data"]
+    fn streaming_resume_identity_benchmark() {
+        let files = HashMap::from([("fixture".to_owned(),SegmentFile {
+            offset: 4096, length: 1638400000, keep_encrypted: true,
+            data_hashs: (0..400000).map(|n| [n as u8;20]).collect(),
+        })]);
+        let start = std::time::Instant::now();
+        let before = legacy_identity("fixture", &files);
+        let old = start.elapsed().as_secs_f64();
+        let start = std::time::Instant::now();
+        let after = Journal::identity("fixture", &files).unwrap().0;
+        let new = start.elapsed().as_secs_f64();
+        assert_eq!(before,after);
+        eprintln!("IDENTITY_BENCH hashes=400000 legacy_seconds={old:.6} streamed_seconds={new:.6}");
+    }
     #[test]
     fn streaming_resume_reopens_checkpoint_and_rejects_changed_data_or_package() {
         let root = tempfile::tempdir().unwrap();
