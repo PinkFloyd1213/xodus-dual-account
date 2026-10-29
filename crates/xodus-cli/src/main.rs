@@ -8,6 +8,8 @@ use xodus::tokens::{AccountRole, TokenManager};
 
 mod commands;
 mod license;
+mod license_cache;
+mod installation_state;
 mod package;
 mod package_plan;
 #[cfg(feature = "native-webview")]
@@ -122,6 +124,18 @@ enum SubCommand {
         )]
         account: AccountArg,
     },
+    #[command(about = "Extended native Nexus social services") ]
+    NativeSocial {
+        #[command(subcommand)]
+        action: commands::native_social::Action,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = AccountArg::Store,
+            help = "Account role: store or play (friends and chat, falls back to store)"
+        )]
+        account: AccountArg,
+    },
     #[command(about = "Explicit Xbox friends and text chat, JSON request on standard input")]
     Social {
         #[arg(long, required = true)]
@@ -188,6 +202,7 @@ enum SubCommand {
         account: AccountArg,
     },
     #[command(about = "Download and extract the game through streaming algorithm")]
+    #[command(after_help = "Nexus capabilities: update-recovery-v1")]
     Streaming {
         source: String,
         destination: String,
@@ -230,6 +245,15 @@ enum SubCommand {
         materialize_chain: bool,
         #[arg(short, long)]
         market: Option<String>,
+        #[arg(long = "license-cache", help = "Directory for device-bound offline licenses (--license-cache) used when Microsoft is unreachable")]
+        license_cache: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            requires = "license_cache",
+            help = "Launch on the stored offline license without contacting Microsoft (the launcher sets this once it finds Microsoft unreachable)"
+        )]
+        offline: bool,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -239,6 +263,15 @@ enum SubCommand {
     #[command(about = "Decode SPLicenseBlock")]
     SpLicense {
         block: String,
+    },
+    #[command(about = "Show or change whether this device is the account's designated offline PC (JSON on stdout)")]
+    OfflinePc {
+        #[arg(long, help = "Designate (true) or undesignate (false) this device; requires --confirm")]
+        set: Option<bool>,
+        #[arg(long, default_value_t = false, help = "Acknowledge that Microsoft limits changes and allows one offline PC per account")]
+        confirm: bool,
+        #[arg(long = "license-cache", help = "Offline license directory (run --license-cache) to clear when this device is not, or is no longer, designated")]
+        license_cache: Option<String>,
     },
 }
 
@@ -297,9 +330,13 @@ async fn main() -> ExitCode {
     {
         registry.init();
     }
+    // Connects are bounded so an unreachable Microsoft is detected in seconds
+    // (offline launches then fall back to the stored license at once); no
+    // overall request timeout, because this client also streams game data.
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
         .connection_verbose(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap();
     let args = CliArgs::parse();
@@ -358,6 +395,7 @@ async fn main() -> ExitCode {
         SubCommand::Account { .. }
             | SubCommand::Profile { .. }
             | SubCommand::Social { .. }
+            | SubCommand::NativeSocial { .. }
             | SubCommand::GameActivity { .. }
             | SubCommand::Achievements { .. }
             | SubCommand::Library { .. }
@@ -365,10 +403,31 @@ async fn main() -> ExitCode {
             | SubCommand::SpLicense { .. }
             | SubCommand::Logout { .. }
     );
-    if needs_device_credentials {
+    // An offline launch never contacts Microsoft: the stored device license
+    // and the stored offline content license are all it uses.
+    #[cfg(unix)]
+    let offline_launch = matches!(args.command, SubCommand::Run { offline: true, .. });
+    #[cfg(not(unix))]
+    let offline_launch = false;
+    // A launch with an offline license cache may outlive the device token
+    // (it expires while the device is offline). Renewal needs Microsoft, so a
+    // failed renewal must not end the launch before the content-license step,
+    // which still decides: only an unreachable Microsoft lets the stored
+    // offline license stand in, a refusal fails as before.
+    #[cfg(unix)]
+    let launch_with_license_cache = matches!(args.command, SubCommand::Run { license_cache: Some(_), .. });
+    #[cfg(not(unix))]
+    let launch_with_license_cache = false;
+    if needs_device_credentials && !offline_launch {
         if let Err(error) = xodus::tokens::device::ensure_device_credentials(&client, &tokens).await {
-            error.report();
-            return ExitCode::FAILURE;
+            if launch_with_license_cache && tokens.get_device_license().is_ok() {
+                eprintln!(
+                    "Device credential renewal failed; continuing with the stored device license. If Microsoft is unreachable, the offline license stored on this device is used."
+                );
+            } else {
+                error.report();
+                return ExitCode::FAILURE;
+            }
         }
     }
 
@@ -434,6 +493,13 @@ async fn main() -> ExitCode {
         },
         SubCommand::Profile { json, account } => match tokens.resolve(account.into()) {
             Ok(tokens) => commands::profile::run(&tokens, json).await,
+            Err(error) => {
+                error.report();
+                ExitCode::FAILURE
+            }
+        },
+        SubCommand::NativeSocial { action, account } => match tokens.resolve(account.into()) {
+            Ok(tokens) => commands::native_social::run(&tokens, action).await,
             Err(error) => {
                 error.report();
                 ExitCode::FAILURE
@@ -528,6 +594,8 @@ async fn main() -> ExitCode {
             materialize_exe,
             materialize_chain,
             market,
+            license_cache,
+            offline,
         } => {
             commands::run::run(
                 &client,
@@ -538,6 +606,8 @@ async fn main() -> ExitCode {
                 materialize_exe,
                 materialize_chain,
                 market,
+                license_cache,
+                offline,
             )
             .await
         }
@@ -549,6 +619,9 @@ async fn main() -> ExitCode {
             ClepAction::Decrypt { data } => commands::clep::decrypt(data),
         },
         SubCommand::SpLicense { block } => commands::splicense::run(block),
+        SubCommand::OfflinePc { set, confirm, license_cache } => {
+            commands::offline_pc::run(&client, &tokens, set, confirm, license_cache.as_deref().map(std::path::Path::new)).await
+        }
     };
 
     xodus::secrets::destroy_secrets();

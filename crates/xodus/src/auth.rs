@@ -15,6 +15,36 @@ use crate::models::secrets::Token;
 use crate::models::soap;
 use crate::tokens::TokenManager;
 
+type RefreshedUserToken = (String, Token);
+
+/// Two requested scopes may be returned in either order. Reject ambiguous or
+/// incomplete replies before persisting anything or making an Xbox request.
+fn sisu_user_tokens(outcome: ExchangeUserTokenOutcome) -> Result<(String, Option<RefreshedUserToken>), crate::models::secrets::InvalidTokenResponse> {
+    use crate::models::secrets::InvalidTokenResponse;
+    let responses = match outcome {
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(collection)) => collection.security_tokens,
+        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(response)) => vec![*response],
+        _ => return Err(InvalidTokenResponse),
+    };
+    let mut compact = None;
+    let mut refreshed = None;
+    for response in responses {
+        let address = response.applies_to.endpoint_reference.address.clone();
+        match Token::try_from(response)? {
+            Token::Compact(value) if compact.is_none() && !value.is_empty() && !matches!(value.as_str(), "d=" | "t=") => compact = Some(value),
+            Token::Legacy(value) if refreshed.is_none() => {
+                let address = value.key_name.clone().unwrap_or(address);
+                refreshed = Some((address, Token::Legacy(value)));
+            }
+            _ => return Err(InvalidTokenResponse),
+        }
+    }
+    Ok((compact.ok_or(InvalidTokenResponse)?, refreshed))
+}
+
+#[cfg(test)]
+mod sisu_response_tests;
+
 fn get_app_params() -> XalAppParameters {
     XalAppParameters {
         client_id: "000000004424da1f".to_string(),
@@ -128,36 +158,12 @@ pub async fn do_sisu(
     )
     .await?;
 
-    let ExchangeUserTokenOutcome::Issued(
-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
-    ) = user_token
-    else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "error",
-        )));
-    };
-
-    if let Some(sts) = collection.security_tokens.pop() {
-        let address = sts.applies_to.endpoint_reference.address.clone();
-        let sts: Token = sts.try_into()?;
-        let address = if let Token::Legacy(legacy) = &sts {
-            legacy.key_name.clone().unwrap_or(address)
-        } else {
-            address
-        };
+    let (user_token, refreshed) = sisu_user_tokens(user_token)?;
+    if let Some((address, sts)) = refreshed {
         if let Err(err) = manager.save_user_token(address, sts) {
             tracing::warn!("Failed to persist refreshed STS token: {err}");
         }
     }
-    let token = collection.security_tokens.into_iter().next().ok_or(crate::models::secrets::InvalidTokenResponse)?;
-    let token: Token = token.try_into()?;
-    let Token::Compact(user_token) = token else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "error",
-        )));
-    };
 
     let mut auth = XalAuthenticator::new(
         XalAppParameters {
@@ -181,8 +187,7 @@ pub async fn do_sisu(
         .await?;
     let resp = auth
         .sisu_authorize_rps(&user_token, &data.token, None)
-        .await
-        .expect("ok");
+        .await?;
     Ok((auth, resp, data))
 }
 

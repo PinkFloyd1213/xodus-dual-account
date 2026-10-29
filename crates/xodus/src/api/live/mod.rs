@@ -37,11 +37,44 @@ mod diagnostic_tests {
 
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 
+#[derive(Debug, thiserror::Error)]
+pub enum DeviceCredentialError {
+    #[error("Microsoft device registration request failed.")]
+    Transport(#[from] reqwest::Error),
+    #[error("Microsoft returned an invalid device registration response.")]
+    InvalidResponse,
+}
+
+const DEVICE_RESPONSE_LIMIT: usize = 1024 * 1024;
+
+async fn device_credential_response(response: reqwest::Response) -> Result<DeviceAddResponse, DeviceCredentialError> {
+    let mut response = response.error_for_status()?;
+    if response.content_length().is_some_and(|length| length > DEVICE_RESPONSE_LIMIT as u64) {
+        return Err(DeviceCredentialError::InvalidResponse);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > DEVICE_RESPONSE_LIMIT {
+            return Err(DeviceCredentialError::InvalidResponse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = std::str::from_utf8(&body).map_err(|_| DeviceCredentialError::InvalidResponse)?;
+    let parsed: DeviceAddResponse = quick_xml::de::from_str(text).map_err(|_| DeviceCredentialError::InvalidResponse)?;
+    if !parsed.success || parsed.puid.is_empty() || parsed.license.splicense_block.is_empty() {
+        return Err(DeviceCredentialError::InvalidResponse);
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod device_response_tests;
+
 pub async fn login_device_credential(
     client: &reqwest::Client,
     data: DeviceAddRequest,
-) -> reqwest::Result<DeviceAddResponse> {
-    let data = quick_xml::se::to_string(&data).unwrap();
+) -> Result<DeviceAddResponse, DeviceCredentialError> {
+    let data = quick_xml::se::to_string(&data).map_err(|_| DeviceCredentialError::InvalidResponse)?;
 
     let response = client
         .post("https://login.live.com/ppsecure/deviceaddcredential.srf")
@@ -51,9 +84,7 @@ pub async fn login_device_credential(
         .body(data)
         .send()
         .await?;
-    let text = response.text().await?;
-    let resp: DeviceAddResponse = quick_xml::de::from_str(&text).expect("Failed to de xml");
-    Ok(resp)
+    device_credential_response(response).await
 }
 
 pub async fn authenticate_device(

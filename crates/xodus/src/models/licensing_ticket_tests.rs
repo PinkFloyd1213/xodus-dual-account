@@ -27,7 +27,7 @@ fn content_ticket_jwe_is_bare_only_at_the_licensing_boundary() {
         jwe(json!({"alg":"RSA-OAEP-256","enc":"A256GCM"}), "a2V5"),
     ] {
         let Token::Compact(original) = delegation(&raw) else { panic!("fixture"); };
-        assert_eq!(original, format!("d={raw}"), "Xbox token conversion is unchanged");
+        assert_eq!(original, format!("t={raw}"), "Xbox sign-in gets compact JWE tickets as t=");
         assert_eq!(store_ticket(original.clone()), format!("t={raw}"), "Store behavior is unchanged");
         assert_eq!(licensing_ticket(original), raw);
         assert_eq!(licensing_ticket(raw.clone()), raw);
@@ -67,6 +67,17 @@ fn content_ticket_dotted_or_malformed_values_are_not_reinterpreted_as_jwe() {
     for raw in invalid {
         assert_eq!(licensing_ticket(format!("d={raw}")), format!("t={raw}"));
         assert_eq!(licensing_ticket(format!("t={raw}")), format!("t={raw}"));
+    }
+}
+
+#[test]
+fn xbox_delegation_ticket_prefix_follows_the_ticket_encoding() {
+    let raw = jwe(json!({"alg":"dir","enc":"A256GCM"}), "");
+    assert!(matches!(delegation(&raw), Token::Compact(value) if value == format!("t={raw}")));
+    for opaque in ["opaque", "EwA4A+synthetic/opaque==", "eyJ.abc", "opaque..iv.ciphertext.tag",
+        "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln"] {
+        assert!(matches!(delegation(opaque), Token::Compact(value) if value == format!("d={opaque}")),
+            "opaque and signed-only tickets keep the exact previous d= form");
     }
 }
 

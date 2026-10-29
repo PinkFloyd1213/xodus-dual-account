@@ -67,17 +67,23 @@ impl TryFrom<soap::RequestSecurityTokenResponse> for Token {
                     .ok_or(InvalidTokenResponse)?
                     .value,
             ),
-            "urn:passport:delegationcompact" => Self::Compact(format!(
-                "d={}",
+            "urn:passport:delegationcompact" => Self::Compact(delegation_ticket(
                 value
                     .requested_security_token
                     .binary_security_token
                     .ok_or(InvalidTokenResponse)?
-                    .value
+                    .value,
             )),
             _ => return Err(InvalidTokenResponse),
         })
     }
+}
+
+/// Xbox Live sign-in needs opaque delegation tickets as "d=", but rejects
+/// compact JWE delegation tickets in that form and accepts them as "t=".
+/// Opaque tickets keep their exact previous form.
+fn delegation_ticket(value: String) -> String {
+    if is_compact_jwe(&value) { format!("t={value}") } else { format!("d={value}") }
 }
 
 /// Store and licensing services reject delegation-compact tickets in the "d="
@@ -92,7 +98,7 @@ pub fn store_ticket(ticket: String) -> String {
 
 /// Format a user ticket only when it is sent to content licensing. Compact JWE
 /// tickets use their bare representation, unlike opaque delegation tickets.
-/// Keep Token conversion (Xbox) and store_ticket (Store) unchanged.
+/// Keep store_ticket (Store) unchanged.
 pub fn licensing_ticket(ticket: String) -> String {
     let bare = ticket.strip_prefix("d=").or_else(|| ticket.strip_prefix("t=")).unwrap_or(&ticket);
     if is_compact_jwe(bare) { bare.to_string() } else { store_ticket(ticket) }

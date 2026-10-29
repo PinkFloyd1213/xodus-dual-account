@@ -19,7 +19,7 @@ use uuid::Uuid;
 use zerocopy::IntoBytes;
 
 use crate::crypt::{TweakGenerator, decrypt_page_xts};
-use crate::layout::{Bytes, PAGE_SIZE, PAGES_PER_BLOCK, Pages};
+use crate::layout::{Bytes, PAGE_SIZE, Pages};
 use crate::math::calculate_hash_block_num_and_run_for_block_num;
 use crate::models::xvd::layout::XvdLayout;
 use crate::models::xvd::{
@@ -29,6 +29,9 @@ use crate::models::xvd::{
 };
 use crate::streaming_ntfs::collect_ntfs_stream_layouts;
 use crate::streaming_http::{Policy, RangeReader, TransferError};
+
+#[path = "streaming_hash_cache.rs"]
+mod hash_cache;
 
 #[cfg(test)]
 #[path = "package_metadata_tests.rs"]
@@ -41,6 +44,10 @@ mod resume_tests;
 #[cfg(test)]
 #[path = "encrypted_image_tests.rs"]
 mod encrypted_image_tests;
+
+#[cfg(test)]
+#[path = "download_throughput_tests.rs"]
+mod throughput_tests;
 
 pub struct SyncSubstream<R> {
     inner: R,
@@ -304,6 +311,33 @@ pub struct EncryptedSectionInfo {
     data_hashs: Vec<[u8; 20]>,
 }
 
+/// Verifies installed plaintext by reconstructing the licensed package ciphertext.
+/// Metadata hashes identify candidates; only a matching reconstructed hash permits reuse.
+pub struct StoredPageVerifier<'a> {
+    file: &'a SegmentFile,
+    section: Option<&'a EncryptedSectionInfo>,
+    ciphers: Option<(Aes128Enc, Aes128Enc)>,
+}
+impl StoredPageVerifier<'_> {
+    pub fn matches(&self, index: usize, bytes: &[u8; PAGE_SIZE]) -> bool {
+        use sha2::{Digest, Sha256};
+        let Some(expected) = self.file.data_hashs.get(index) else { return false; };
+        let mut ciphertext = *bytes;
+        if let Some((tweak_cipher, data_cipher)) = &self.ciphers {
+            let Some(section) = self.section else { return false; };
+            let page = (self.file.offset - section.section_offset) / PAGE_SIZE as u64 + index as u64;
+            let unit = match &section.data_units {
+                Some(units) => match units.get(page as usize) { Some(unit) => *unit, None => return false },
+                None => match u32::try_from(page) { Ok(unit) => unit, Err(_) => return false },
+            };
+            crate::crypt::encrypt_page_xts(&mut ciphertext,
+                TweakGenerator::new(section.header_id, section.vduid).with_data_unit(unit),
+                tweak_cipher, data_cipher);
+        }
+        Sha256::digest(ciphertext)[..20] == expected[..]
+    }
+}
+
 pub struct UserPackageFile {
     pub offset: u64,
     pub length: u64,
@@ -330,6 +364,17 @@ impl SegmentFile {
 }
 
 impl XvdFile {
+    pub fn stored_page_verifier<'a>(&'a self, file: &'a SegmentFile, key: [u8; 32]) -> StoredPageVerifier<'a> {
+        let section = self.encrypted_section_infos.iter().find(|section|
+            file.offset >= section.section_offset && file.offset < section.section_offset + section.section_length);
+        let ciphers = if !file.keep_encrypted && section.is_some() {
+            let tweak_key: [u8; 16] = key[..16].try_into().unwrap();
+            let data_key: [u8; 16] = key[16..].try_into().unwrap();
+            Some((Aes128Enc::new((&tweak_key).into()), Aes128Enc::new((&data_key).into())))
+        } else { None };
+        StoredPageVerifier { file, section, ciphers }
+    }
+
     pub fn content_id(&self) -> uuid::Uuid {
         self.header.vduid
     }
@@ -413,7 +458,10 @@ impl XvdFile {
         }
 
         let mut enc_sections: Vec<EncryptedSectionInfo> = vec![];
-        let mut reader = BufReader::with_capacity(PAGES_PER_BLOCK * XvdHashEntry::SIZE, file);
+        let mut reader = file;
+        let mut hash_cache = hash_cache::HashCache::default();
+        let hash_tree_end = layout.hash_tree.start.to_bytes().0.checked_add(layout.hash_tree.len.0)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "Hash-tree bounds overflow."))?;
         for h in region_headers {
             let key_id = h.key_id;
             let num_pages = h.length.0;
@@ -447,12 +495,10 @@ impl XvdFile {
                 let read_offset = layout.hash_tree.start.to_bytes()
                     + Pages(hash_block).to_bytes()
                     + Bytes(entry_start as u64 * XvdHashEntry::SIZE as u64);
-                reader.seek(SeekFrom::Start(read_offset.0)).await?;
-
-                let mut buf = XvdHashEntry::buffer();
-                for _ in 0..run_length {
-                    reader.read_exact(&mut buf).await?;
-                    let hash = XvdHashEntry::from_array(&buf);
+                let bytes = hash_cache.read(&mut reader, read_offset.0,
+                    run_length as usize * XvdHashEntry::SIZE, hash_tree_end).await?;
+                for entry in bytes.chunks_exact(XvdHashEntry::SIZE) {
+                    let hash = XvdHashEntry::from_array(entry.try_into().unwrap());
                     data_units.push(hash.unit);
                     data_hashs.push(hash.block_hash);
                 }
@@ -883,6 +929,10 @@ impl XvdFile {
         let mut page_in_section = page_start + resume_offset / PAGE_SIZE as u64;
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let mut pending = bytes::BytesMut::new();
+        // Avoid one blocking filesystem write/task per decrypted 4KiB page.
+        // Bounded independently of HTTP frame sizes and parallel file count.
+        const WRITE_BATCH: usize = 256 * 1024;
+        let mut write_batch = Vec::with_capacity(WRITE_BATCH);
         let mut v: u64 = resume_offset;
         let mut last_checkpoint = resume_offset;
         let start = sfile.offset.checked_add(v).ok_or(TransferError::new("transfer-range", 0))?;
@@ -897,6 +947,8 @@ impl XvdFile {
                     // Release the HTTP connection while parked. Resuming issues
                     // a fresh Range request at v, preserving pending partial pages.
                     transfer.disconnect();
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
                     out.flush().await?;
                     checkpoint(sfile.length - remaining)?;
                     control.wait_for(|paused| !*paused).await.ok();
@@ -921,6 +973,8 @@ impl XvdFile {
                 result => {
                     // Only fully written pages become durable, never a pending
                     // partial encrypted page or merely reported progress.
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
                     out.flush().await?;
                     checkpoint(sfile.length - remaining)?;
                     return Err(Box::new(result.err().unwrap_or(TransferError::new("transfer-eof", 0))));
@@ -973,13 +1027,19 @@ impl XvdFile {
                 } else {
                     to_write_remaining
                 };
-                out.write_all(&page[..to_write]).await?;
+                write_batch.extend_from_slice(&page[..to_write]);
+                if write_batch.len() >= WRITE_BATCH {
+                    out.write_all(&write_batch).await?;
+                    write_batch.clear();
+                }
                 remaining -= to_write_remaining as u64;
 
                 page_in_section += 1;
             }
             let written = sfile.length - remaining;
             if written.saturating_sub(last_checkpoint) >= 32 * 1024 * 1024 {
+                out.write_all(&write_batch).await?;
+                write_batch.clear();
                 out.flush().await?;
                 checkpoint(written)?;
                 last_checkpoint = written;
@@ -991,6 +1051,7 @@ impl XvdFile {
                 remaining, sfile.length, v
             ))));
         }
+        out.write_all(&write_batch).await?;
         out.flush().await?;
         checkpoint(sfile.length)?;
         Ok(())

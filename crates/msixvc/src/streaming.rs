@@ -24,6 +24,27 @@ pub fn resume_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Incremental checkpoint identity digest. Callers can serialize large layouts
+/// through a bounded buffer instead of materializing their entire JSON encoding.
+#[derive(Default)]
+pub struct ResumeDigest(sha2::Sha256);
+
+impl std::io::Write for ResumeDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl ResumeDigest {
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        self.0.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 type PendingHttpOpen = Pin<Box<dyn Future<Output = std::io::Result<OpenedHttpStream>> + Send>>;
 
