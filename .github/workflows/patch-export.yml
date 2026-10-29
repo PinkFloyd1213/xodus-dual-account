@@ -55,13 +55,8 @@ jobs:
           base, n = (match.group(1), int(match.group(2))) if match else (lock["patchId"], 0)
           lock["patchId"] = f"{base}-dual-account-{n + 1}"
           lock["repository"] = "https://github.com/PinkFloyd1213/xodus-dual-account.git"
-          # Same layout as the Nexus lock: one key per line, one patch per line.
-          lines = ["{"] + [f"  {json.dumps(k)}: {json.dumps(v)}," for k, v in lock.items() if k != "patches"]
-          lines.append('  "patches": [')
-          lines += [f'    {{ "file": {json.dumps(p["file"])}, "sha256": {json.dumps(p["sha256"])} }}' + ("," if i < len(lock["patches"]) - 1 else "")
-                    for i, p in enumerate(lock["patches"])]
-          lines += ["  ]", "}"]
-          path.write_text("\n".join(lines) + "\n")
+          # Same layout as the Nexus lock (2-space JSON since Nexus 0.4.1).
+          path.write_text(json.dumps(lock, indent=2) + "\n")
           print(lock["patchId"])
           PY
           )
