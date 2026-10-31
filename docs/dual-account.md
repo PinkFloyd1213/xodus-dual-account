@@ -392,3 +392,13 @@ SISU response validation) add **no** new consumer of the user account. The
 
 The streaming update, hash cache and installation state changes add no
 account consumer.
+
+## Nexus sync linux-run-v73 (backend 0.2.13)
+
+The new upstream patch only touches `xodus-cli/src/commands/game_activity.rs`
+(`history_request` helper with the `TitleHistory` decoration and an
+`Accept-Language` header, plus a local-server test). It adds **no** new
+consumer of the user account: `lookup` still goes through `xbox_session` and
+`get_user` on the manager chosen by the caller (`--account play` with fallback,
+`store` by default). The map is unchanged. The merge keeps the dual-account
+`NEXUS_ACTIVITY_DIAGNOSTIC_V1` diagnostics on top of upstream's helper.
