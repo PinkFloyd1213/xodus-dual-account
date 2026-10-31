@@ -2,7 +2,7 @@
 use std::{process::ExitCode, time::Duration};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use serde_json::{Value, json};
-use xodus::{models::{live::ExchangeUserTokenOutcome, secrets::Token, soap}, tokens::TokenManager};
+use xodus::{models::{live::ExchangeUserTokenOutcome, secrets::Token, soap}, tokens::{AccountRole, TokenManager}};
 
 const PROFILE: &str = "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag,PublicGamerpic";
 const MAX_IMAGE: usize = 2 * 1024 * 1024;
@@ -130,9 +130,12 @@ async fn profile(tokens: &TokenManager) -> Result<Value, &'static str> {
 
 pub async fn run(tokens: &TokenManager, json_output: bool) -> ExitCode {
     let account = tokens.get_user().ok().map(|user|user.username);
+    // Membership always belongs to the store account, even for a play profile.
+    let store = tokens.for_role(AccountRole::Store);
+    let store_account = store.get_user().ok().map(|user|user.username);
     let membership = async {
-        match account.as_deref() {
-            Some(account) => super::subscription::lookup(tokens, account).await,
+        match store_account.as_deref() {
+            Some(store_account) => super::subscription::lookup(&store, store_account).await,
             None => json!({"status":"unknown"}),
         }
     };

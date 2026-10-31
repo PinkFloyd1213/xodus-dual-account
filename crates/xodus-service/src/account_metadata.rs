@@ -19,8 +19,32 @@ pub fn bound_ids(ticket: Option<&User>, store: Option<&User>) -> (Option<String>
     (Some(xbox), Some(store_id))
 }
 
+/// Dual-account (store/play): the Xbox id comes from the play session that
+/// issued the ticket, checked against a re-read of that same session; the Store
+/// id from the store session. As on Windows, the two accounts may differ. With
+/// no play account both sessions are the store one, so this equals `bound_ids`.
+pub fn bound_ids_for_roles(ticket: Option<&User>, current: Option<&User>, store: Option<&User>) -> (Option<String>, Option<String>) {
+    let (Some(xbox), _) = bound_ids(ticket, current) else { return (None, None) };
+    let Some(store_id) = store.and_then(|store| account_id(&store.puid)) else { return (None, None) };
+    (Some(xbox), Some(store_id))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn account_metadata_pairs_play_and_store_like_windows() {
+        let play = user("0123456789ABCDEF");
+        let store = User { puid: "fedcba9876543210".into(), username: "store@example.invalid".into() };
+        assert_eq!(bound_ids_for_roles(Some(&play), Some(&play), Some(&store)),
+            (Some("0123456789abcdef".into()), Some("fedcba9876543210".into())));
+        // Single account (play falls back to store): identical to bound_ids.
+        assert_eq!(bound_ids_for_roles(Some(&store), Some(&store), Some(&store)), bound_ids(Some(&store), Some(&store)));
+        // The play session changed during the exchange, or a session is missing.
+        assert_eq!(bound_ids_for_roles(Some(&play), Some(&store), Some(&store)), (None, None));
+        assert_eq!(bound_ids_for_roles(Some(&play), None, Some(&store)), (None, None));
+        assert_eq!(bound_ids_for_roles(Some(&play), Some(&play), None), (None, None));
+        assert_eq!(bound_ids_for_roles(Some(&play), Some(&play), Some(&user("0000000000000000"))), (None, None));
+    }
     use super::*;
     fn user(puid: &str) -> User { User { puid: puid.into(), username: "synthetic@example.invalid".into() } }
     #[test]

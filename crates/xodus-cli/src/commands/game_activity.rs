@@ -24,7 +24,9 @@ fn minutes(value: &Value, xuid: &str, title_id: u32) -> Result<Option<f64>, &'st
             for stat in list["stats"].as_array().ok_or("stats-shape")? {
                 if stat["name"].as_str() != Some("MinutesPlayed") { continue; }
                 if stat["xuid"].as_str() != Some(xuid) { return Err("stats-user"); }
-                let raw = stat["value"].as_str().ok_or("stats-value")?;
+                // A title with no recorded play time omits the value: no data, not an error.
+                let Some(raw) = stat.get("value").filter(|value| !value.is_null()) else { continue; };
+                let raw = raw.as_str().ok_or("stats-value")?;
                 if raw.is_empty() || raw.len() > 32 || !raw.bytes().all(|c| c.is_ascii_digit() || c == b'.') { return Err("stats-value"); }
                 let n = raw.parse::<f64>().map_err(|_| "stats-value")?;
                 if !n.is_finite() || !(0.0..=1_000_000_000.0).contains(&n) { return Err("stats-range"); }
@@ -65,6 +67,11 @@ fn history_request(client: &reqwest::Client, authorization: &str, xuid: &str, ti
         .header("Accept-Language", "en-US")
 }
 
+/// Static stage + HTTP status only (0 when unknown), never a response or account.
+fn diagnostic(kind: &str, (stage, status): (&str, u16)) {
+    eprintln!("NEXUS_ACTIVITY_DIAGNOSTIC_V1 {kind}-{stage} {status}");
+}
+
 async fn lookup(tokens: &TokenManager, title_id: u32) -> Result<Value, &'static str> {
     let (client, authorization, account) = xbox_session(tokens).await?;
     let response = client.get("https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag")
@@ -78,17 +85,23 @@ async fn lookup(tokens: &TokenManager, title_id: u32) -> Result<Value, &'static 
     let stats = async {
         let response = client.post("https://userstats.xboxlive.com/batch")
             .header("Authorization", &authorization).header("x-xbl-contract-version", "2")
-            .json(&body).send().await.map_err(|_| "stats-request")?;
-        let bytes = bounded(response, 256 * 1024).await?;
-        minutes(&serde_json::from_slice(&bytes).map_err(|_| "stats-json")?, &xuid, title_id)
+            .json(&body).send().await.map_err(|_| ("request", 0))?;
+        let status = response.status().as_u16();
+        let bytes = bounded(response, 256 * 1024).await.map_err(|stage| (stage, status))?;
+        let value = serde_json::from_slice(&bytes).map_err(|_| ("json", status))?;
+        minutes(&value, &xuid, title_id).map_err(|stage| (stage, status))
     };
     let history = async {
         let response = history_request(&client, &authorization, &xuid, title_id)
-            .send().await.map_err(|_| "title-request")?;
-        let bytes = bounded(response, 256 * 1024).await?;
-        last_played(&serde_json::from_slice(&bytes).map_err(|_| "title-json")?, &xuid, title_id)
+            .send().await.map_err(|_| ("request", 0))?;
+        let status = response.status().as_u16();
+        let bytes = bounded(response, 256 * 1024).await.map_err(|stage| (stage, status))?;
+        let value = serde_json::from_slice(&bytes).map_err(|_| ("json", status))?;
+        last_played(&value, &xuid, title_id).map_err(|stage| (stage, status))
     };
     let (played, history) = tokio::join!(stats, history);
+    if let Err(error) = played { diagnostic("stats", error); }
+    if let Err(error) = history { diagnostic("title", error); }
     // One unavailable statistic must not hide the other. Do not invent zero.
     let (played_ok, history_ok) = (played.is_ok(), history.is_ok());
     if !played_ok && !history_ok { return Err("activity-unavailable"); }
@@ -120,6 +133,14 @@ mod tests {
         assert_eq!(minutes(&root, "123", 42).unwrap(), Some(2052.0));
         let grouped = json!({"groups":[{"titleid":"42","statlistscollection":[list(json!("2052"))]}],"statlistscollection":[list(json!("2052"))]});
         assert_eq!(minutes(&grouped, "123", 42).unwrap(), Some(2052.0));
+    }
+    #[test]
+    fn activity_treats_a_stat_without_value_as_no_data() {
+        let stat = |extra: Value| { let mut s = json!({"name":"MinutesPlayed","xuid":"123"}); s.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); s };
+        for stat in [stat(json!({})), stat(json!({"value": null}))] {
+            let lists = json!({"statlistscollection":[{"arrangebyfield":"xuid","arrangebyfieldid":"123","stats":[stat]}]});
+            assert_eq!(minutes(&lists, "123", 42).unwrap(), None);
+        }
     }
     #[test]
     fn activity_distinguishes_missing_from_real_zero_and_fractions() {
