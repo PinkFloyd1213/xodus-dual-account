@@ -4,6 +4,7 @@ use xodus::models::secrets::Token;
 use xodus::models::soap;
 use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
 use xodus::proto::xodus::XodusMessageType;
+use xodus::tokens::AccountRole;
 
 use crate::XML_MAGIC;
 use crate::simple_context::SimpleContext;
@@ -33,11 +34,36 @@ pub async fn handle(
     socket.write_all(&data).await
 }
 
+/// Account each request is issued for: the game's own identity uses the play
+/// account (falling back to store), Store licensing and packages use store.
+pub fn message_role(message_type: XodusMessageType) -> Option<AccountRole> {
+    match message_type {
+        XodusMessageType::MsaTokenRequest => Some(AccountRole::Play),
+        XodusMessageType::StoreLicenseTokenRequest
+        | XodusMessageType::StorePackageUpdatesRequest => Some(AccountRole::Store),
+        _ => None,
+    }
+}
+
 pub async fn parse_message(
     context: &mut SimpleContext,
     message_type: XodusMessageType,
     buffer: Vec<u8>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let tokens = match message_role(message_type) {
+        Some(requested) => {
+            let tokens = context.tokens().resolve(requested)?;
+            // Role names only: never account identifiers or token material.
+            tracing::info!(
+                request = ?message_type,
+                role = tokens.role().as_str(),
+                fallback = tokens.role() != requested,
+                "Issuing credentials"
+            );
+            Some(tokens)
+        }
+        None => None,
+    };
     match message_type {
         XodusMessageType::Ping => Ok(buffer),
         XodusMessageType::StorePackageUpdatesRequest => {
@@ -54,10 +80,11 @@ pub async fn parse_message(
             let string_buf = std::str::from_utf8(&buffer)?;
             tracing::debug!("String buffer: {string_buf:?}");
             let req = quick_xml::de::from_str::<MSATokenRequest>(string_buf)?;
-            let identity_session = context.tokens().get_user_sts_session()?;
+            let tokens = tokens.ok_or(xodus::models::secrets::InvalidTokenResponse)?;
+            let identity_session = tokens.get_user_sts_session()?;
             let request_token = match &identity_session {
                 Some((_, token)) => token.clone(),
-                None => context.tokens().get_user_sts_token()?,
+                None => tokens.get_user_sts_token()?,
             };
             let Token::Legacy(token) = request_token else {
                 return Ok(vec![]);
@@ -117,7 +144,8 @@ pub async fn parse_message(
                         } else {
                             address
                         };
-                        if let Err(err) = context.tokens().save_user_token(address, sts) {
+                        // Persist into the role that issued it, never another account.
+                        if let Err(err) = tokens.save_user_token(address, sts) {
                             tracing::warn!("Failed to persist refreshed STS token: {err}");
                         }
                     }
@@ -127,13 +155,15 @@ pub async fn parse_message(
                     let Token::Compact(user_token) = token else {
                         return Ok(vec![]);
                     };
-                    // Store licensing uses this same session facade. Bind the
-                    // Xbox ticket's MSA principal to its current Store account,
-                    // never infer either account identifier from an Xbox XUID.
-                    let current_identity = context.tokens().get_user_sts_session().ok().flatten();
-                    let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids(
+                    // Bind the Xbox ticket's MSA principal to its own (play) session,
+                    // re-read to reject a change mid-exchange, and the Store id to
+                    // the store session; never infer either from an Xbox XUID.
+                    let current_identity = tokens.get_user_sts_session().ok().flatten();
+                    let store_identity = context.tokens().get_user_sts_session().ok().flatten();
+                    let (xbox_msa_account_id, store_msa_account_id) = crate::account_metadata::bound_ids_for_roles(
                         identity_session.as_ref().map(|(user, _)| user),
-                        current_identity.as_ref().map(|(user, _)| user));
+                        current_identity.as_ref().map(|(user, _)| user),
+                        store_identity.as_ref().map(|(user, _)| user));
                     let payload = MSATokenResponse {
                         token: user_token,
                         expiry: expiry.timestamp(),
@@ -151,5 +181,27 @@ pub async fn parse_message(
             }
         }
         _ => Err("Unimplemented".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_and_play_message_roles() {
+        assert_eq!(
+            message_role(XodusMessageType::MsaTokenRequest),
+            Some(AccountRole::Play)
+        );
+        for message in [
+            XodusMessageType::StoreLicenseTokenRequest,
+            XodusMessageType::StorePackageUpdatesRequest,
+        ] {
+            assert_eq!(message_role(message), Some(AccountRole::Store));
+        }
+        for message in [XodusMessageType::Ping, XodusMessageType::Unknown] {
+            assert_eq!(message_role(message), None);
+        }
     }
 }
