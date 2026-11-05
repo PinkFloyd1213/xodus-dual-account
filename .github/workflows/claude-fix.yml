@@ -1,0 +1,147 @@
+# When a check fails on a same-repo PR into dual-account: rerun it once if the
+# log shows a network or runner hiccup, otherwise let Claude read the failed
+# logs, fix the branch and push (the checks then run again). At most 4 fix
+# commits per PR, then it hands over to the owner. Never merges.
+name: Claude CI fix
+
+on:
+  workflow_run:
+    workflows: [Dual-account, Claude PR check]
+    types: [completed]
+
+jobs:
+  fix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    # Job level, so the many skipped runs (successes) never queue here.
+    concurrency:
+      group: claude-fix-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    timeout-minutes: 90
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      WORKFLOW: ${{ github.event.workflow_run.name }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: write
+    steps:
+      - name: Triage the failure
+        id: triage
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --base dual-account --state open --json number,headRefOid --jq '.[0] // empty')
+          [ -n "$pr" ] || { echo "No open PR for $BRANCH."; exit 0; }
+          number=$(jq -r .number <<<"$pr")
+          if [ "$(jq -r .headRefOid <<<"$pr")" != "$SHA" ]; then echo "PR #$number moved past ${SHA:0:7}; its new checks decide."; exit 0; fi
+          if gh api "repos/$GITHUB_REPOSITORY/issues/$number/comments" --paginate --jq '.[].body' | grep -qF "<!-- claude-fix $SHA $WORKFLOW -->"; then
+            echo "$WORKFLOW on ${SHA:0:7} was already handled."; exit 0
+          fi
+          mkdir -p /tmp/ci
+          gh run view "$RUN_ID" -R "$GITHUB_REPOSITORY" --log-failed | tail -n 800 > /tmp/ci/failed.log || true
+          # Network or runner hiccups (Claude PR check failures are always those): one rerun.
+          if [ "$ATTEMPT" = 1 ] && { [ "$WORKFLOW" = "Claude PR check" ] || grep -qiE \
+              "HTTP (error )?5[0-9][0-9]|status code 5[0-9][0-9]|50[234] (Bad Gateway|Service Unavailable|Gateway Time-?out)|ETIMEDOUT|ECONNRESET|EAI_AGAIN|socket hang up|Could not resolve host|TLS handshake timeout|Connection timed out|runner has received a shutdown signal|lost communication with the server|apt attempt 3 failed" /tmp/ci/failed.log; }; then
+            echo "Transient failure in $WORKFLOW: rerunning the failed jobs once."
+            gh run rerun "$RUN_ID" -R "$GITHUB_REPOSITORY" --failed
+            exit 0
+          fi
+          [ "$WORKFLOW" != "Claude PR check" ] || { echo "Claude PR check failed twice; leaving it."; exit 0; }
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "fix=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.triage.outputs.fix == 'true'
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+      - name: Count earlier fixes
+        id: budget
+        if: steps.triage.outputs.fix == 'true'
+        run: |
+          fixes=$(git log --oneline origin/dual-account..HEAD --grep='\[ci-fix\]' | wc -l)
+          echo "Earlier CI fixes on this PR: $fixes"
+          [ "$fixes" -lt 4 ] && echo "ok=true" >> "$GITHUB_OUTPUT" || true
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.budget.outputs.ok == 'true'
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+      - name: Restore downloaded Ubuntu packages
+        if: steps.budget.outputs.ok == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-archives
+          key: apt-noble-native-v1
+      - name: Install build tools
+        if: steps.budget.outputs.ok == 'true'
+        timeout-minutes: 8
+        run: |
+          # The runners' azure mirror stalls; apt goes through apt-mirrors.txt, so rewrite that list too.
+          sudo sed -i -E "s#https?://azure\.archive\.ubuntu\.com/ubuntu#https://archive.ubuntu.com/ubuntu#g" /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          mkdir -p ~/apt-archives/partial
+          for attempt in 1 2 3; do
+            timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update \
+              && timeout 150 sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Dir::Cache::Archives="$HOME/apt-archives" install -y --no-install-recommends build-essential pkg-config libssl-dev protobuf-compiler libdbus-1-dev \
+              && sudo chown -R "$USER" ~/apt-archives && exit 0
+            echo "apt attempt $attempt failed, retrying"; sleep 10
+          done
+          exit 1
+      - uses: anthropics/claude-code-action@v1
+        if: steps.budget.outputs.ok == 'true' && env.HAS_CLAUDE_TOKEN == 'true'
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Merges bring .github/workflows changes; only SYNC_TOKEN may push those.
+          # Its pushes also start the PR checks again (GITHUB_TOKEN pushes do not).
+          github_token: ${{ secrets.SYNC_TOKEN || github.token }}
+          prompt: |
+            You maintain the "dual-account" fork of Xodus used by Xodus Nexus. Read docs/dual-account.md first:
+            the store account owns licenses/entitlements/downloads, the play account is the in-game identity,
+            device credentials are shared, and with no play account everything must behave exactly like upstream.
+            The "${{ env.WORKFLOW }}" workflow failed on pull request #${{ steps.triage.outputs.number }}
+            (branch ${{ env.BRANCH }} into dual-account) at commit ${{ env.SHA }}. The end of the failed job
+            logs is in /tmp/ci/failed.log; `gh run view ${{ env.RUN_ID }} --log-failed` has the rest.
+
+            1. Find the cause in the log. If it is infrastructure (network, mirror, runner), change nothing.
+            2. Otherwise fix it on this branch. If it does not merge cleanly into dual-account, run
+               `git merge origin/dual-account` and resolve the conflicts (always merge, never rebase:
+               nexus-base must stay an ancestor of dual-account). Reproduce with the command the job ran
+               (cargo fmt --check --all, cargo clippy ..., cargo build --locked --release --no-default-features
+               -p xodus-cli -p xodus-service, cargo test --locked ...), fix the source, rerun until it passes.
+               Keep every dual-account change and every upstream change; route any new use of the user
+               account per docs/dual-account.md. Do not weaken or delete tests unless one is clearly wrong.
+            3. Commit with messages ending with " [claude-review] [ci-fix]" and push with `git push origin HEAD`.
+               Never merge, never force-push, never touch secrets or tokens, never print tokens or account data.
+            Write a short summary in French to /tmp/claude-summary.md: the cause, what you fixed, routing
+            decisions, what is left for a human, and whether the PR looks safe to merge once the checks are green.
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(cargo clippy *),Bash(gh run view *),Bash(gh pr view *),Bash(gh pr diff *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(git rev-parse *),Bash(git ls-files *),Bash(ls *),Bash(head *),Bash(tail *),Bash(wc *),Bash(grep *),Bash(sort *),Bash(uniq *),Bash(cat *),Bash(sed -n *),Bash(diff *),Bash(find *),Bash(cd *)"
+      - name: Report on the PR
+        if: always() && steps.triage.outputs.fix == 'true'
+        env:
+          NUMBER: ${{ steps.triage.outputs.number }}
+          OK: ${{ steps.budget.outputs.ok }}
+        run: |
+          {
+            echo "<!-- claude-fix $SHA $WORKFLOW -->"
+            echo "**Claude CI fix** — échec de *$WORKFLOW* sur \`${SHA:0:7}\` ([log]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID))"
+            echo
+            if [ "$OK" != true ]; then
+              echo "4 corrections automatiques déjà poussées sur cette PR : je m'arrête, à toi de regarder."
+            elif [ -s /tmp/claude-summary.md ]; then
+              cat /tmp/claude-summary.md
+            else
+              echo "Claude n'a pas laissé de résumé ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+            fi
+          } > /tmp/comment.md
+          gh pr comment "$NUMBER" -R "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
