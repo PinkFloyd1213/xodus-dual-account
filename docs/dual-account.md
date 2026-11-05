@@ -402,3 +402,13 @@ consumer of the user account: `lookup` still goes through `xbox_session` and
 `get_user` on the manager chosen by the caller (`--account play` with fallback,
 `store` by default). The map is unchanged. The merge keeps the dual-account
 `NEXUS_ACTIVITY_DIAGNOSTIC_V1` diagnostics on top of upstream's helper.
+
+## Nexus sync linux-run-v75 (backend 0.2.14)
+
+The new upstream patch only touches `xodus-cli/src/commands/run.rs`: a private
+(`0700`) launch view, plus a host-owned DLC mount workspace (`XODUS_MOUNT_ROOT`,
+`.xodus-mounts-` prefix, flock + marker sweep). It adds **no** new consumer of
+the user account (`get_user`, `get_user_sts_token`, `save_user_token`,
+`remove_persistent`, `session::prepare`, `xbox_session`, `store_session` are not
+used). The existing PlayFab (`play`) and content license (`store`) routing in
+`run` is untouched. The map is unchanged.

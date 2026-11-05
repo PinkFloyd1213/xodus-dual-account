@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,7 +40,7 @@ async fn playfab_auth_header(client: &reqwest::Client, tokens: &TokenManager) ->
 }
 
 const LAUNCH_STUB_SUFFIX: &str = ".xodus-launch.exe";
-const LAUNCH_VIEW_PREFIXES: [&str; 2] = [".xodus-chain-", ".xodus-offline-"];
+const LAUNCH_VIEW_PREFIXES: [&str; 3] = [".xodus-chain-", ".xodus-offline-", ".xodus-mounts-"];
 const LAUNCH_VIEW_LOCK_SUFFIX: &str = ".lock";
 
 /// A temporary launch view plus the lock that marks it in use. The lock fd is
@@ -107,6 +107,81 @@ impl Drop for LaunchViewLock {
 /// Open an existing lock file for locking without blocking on, or following,
 /// anything that is not a regular file. Write access lets the exclusive lock
 /// work where flock is emulated with byte-range locks (NFS).
+const MOUNT_WORKSPACE_PREFIX: &str = ".xodus-mounts-";
+const MOUNT_WORKSPACE_ENV: &str = "XODUS_MOUNT_ROOT";
+
+fn mount_workspace_marker_matches(file: &std::fs::File, directory: &std::fs::Metadata) -> bool {
+    let Ok(metadata) = file.metadata() else { return false };
+    if metadata.len() == 0 || metadata.len() > 128 { return false; }
+    let mut bytes = [0u8; 128];
+    let Ok(length) = file.read_at(&mut bytes, 0) else { return false };
+    if length as u64 != metadata.len() { return false; }
+    let Ok(text) = std::str::from_utf8(&bytes[..length]) else { return false };
+    let mut lines = text.lines();
+    lines.next() == Some("NXM1")
+        && lines.next().and_then(|v| v.parse::<u64>().ok()) == Some(directory.dev())
+        && lines.next().and_then(|v| v.parse::<u64>().ok()) == Some(directory.ino())
+        && lines.next().is_none()
+}
+
+/// The host owns the workspace so Wine sharing modes and a game crash cannot
+/// strand copied content forever. An inherited flock keeps live descendants
+/// protected; a later launch sweeps a terminated session's verified workspace.
+struct DlcMountWorkspace {
+    view: Option<LaunchView>,
+    windows_path: String,
+}
+
+impl DlcMountWorkspace {
+    fn new(source_root: &Path) -> std::io::Result<Self> {
+        Self::from_view(launch_view_directory(source_root, MOUNT_WORKSPACE_PREFIX)?)
+    }
+
+    fn from_view(view: LaunchView) -> std::io::Result<Self> {
+        let lock = view._lock.as_ref().ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::Unsupported, "DLC workspace requires a session lock"))?;
+        let metadata = std::fs::symlink_metadata(view.path())?;
+        let marker = format!("NXM1\n{}\n{}\n", metadata.dev(), metadata.ino());
+        lock._file.write_all_at(marker.as_bytes(), 0)?;
+        lock._file.set_len(marker.len() as u64)?;
+        let path = view.path().to_str().ok_or_else(||
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "DLC workspace path is not UTF-8"))?;
+        let windows_path = format!("Z:{}", path.replace('/', "\\"));
+        Ok(Self { view: Some(view), windows_path })
+    }
+
+    fn configure(&self, command: &mut Command) {
+        command.env(MOUNT_WORKSPACE_ENV, &self.windows_path);
+    }
+}
+
+impl Drop for DlcMountWorkspace {
+    fn drop(&mut self) {
+        let Some(LaunchView { dir, mut _lock }) = self.view.take() else { return };
+        // Disable TempDir's unconditional removal while descendants may still
+        // own the inherited descriptor. Removing their live view is unsafe.
+        let path = dir.keep();
+        let Some(mut lock) = _lock.take() else { return };
+        let lock_path = std::mem::take(&mut lock.path);
+        let expected_lock = lock._file.metadata().ok();
+        drop(lock); // Close our fd without unlinking the published lock.
+        let Ok(file) = open_launch_view_lock(&lock_path) else { return };
+        let matching_lock = expected_lock.as_ref().is_some_and(|expected|
+            file.metadata().is_ok_and(|actual| actual.dev() == expected.dev() && actual.ino() == expected.ino()));
+        if !matching_lock { return; }
+        let matching_directory = std::fs::symlink_metadata(&path).is_ok_and(|metadata|
+            metadata.is_dir() && mount_workspace_marker_matches(&file, &metadata));
+        if !matching_directory {
+            // Never leave a sweep marker attached to a replaced directory.
+            let _ = std::fs::remove_file(lock_path);
+            return;
+        }
+        if fs2::FileExt::try_lock_exclusive(&file).is_ok() && std::fs::remove_dir_all(&path).is_ok() {
+            let _ = std::fs::remove_file(lock_path);
+        }
+    }
+}
+
 fn open_launch_view_lock(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     if !std::fs::symlink_metadata(path)?.is_file() {
@@ -165,6 +240,10 @@ fn sweep_stale_launch_views(parent: &Path) -> usize {
         let stale = match open_launch_view_lock(&lock_path) {
             Ok(file) => {
                 if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                    continue;
+                }
+                if undotted.starts_with(&MOUNT_WORKSPACE_PREFIX[1..])
+                    && !mount_workspace_marker_matches(&file, &metadata) {
                     continue;
                 }
                 let stale = std::fs::remove_dir_all(&path).is_ok();
@@ -431,6 +510,15 @@ fn probe_launch_view_links(directory: &Path) -> std::io::Result<()> {
     std::fs::remove_file(probe)
 }
 
+fn check_private_launch_view(directory: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != unsafe { nix::libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+    }
+    Ok(())
+}
+
 fn launch_view_directory_with(
     source_root: &Path,
     fallback: &Path,
@@ -438,20 +526,22 @@ fn launch_view_directory_with(
     mut probe: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<TempDir> {
     let parent = source_root.parent().unwrap_or(fallback);
-    if let Ok(directory) = Builder::new().prefix(prefix).tempdir_in(parent) {
-        match probe(directory.path()) {
+    let permissions = || std::fs::Permissions::from_mode(0o700);
+    if let Ok(directory) = Builder::new().prefix(prefix).permissions(permissions()).tempdir_in(parent) {
+        match probe(directory.path()).and_then(|()| check_private_launch_view(directory.path())) {
             Ok(()) => return Ok(directory),
             Err(error) if matches!(error.raw_os_error(), Some(nix::libc::EPERM | nix::libc::EOPNOTSUPP | nix::libc::ENOSYS)) => {
-                // Some install filesystems allow directories but not symlinks.
-                // Drop only this private empty view, then try the ordinary temp
+                // Some install filesystems cannot preserve private permissions
+                // or create symlinks. Drop only this empty view, then try the temp
                 // directory once. Never change mount/security settings or copy
                 // the whole game as a substitute for the links.
             }
             Err(error) => return Err(error),
         }
     }
-    let directory = Builder::new().prefix(prefix.trim_start_matches('.')).tempdir_in(fallback)?;
+    let directory = Builder::new().prefix(prefix.trim_start_matches('.')).permissions(permissions()).tempdir_in(fallback)?;
     probe(directory.path())?;
+    check_private_launch_view(directory.path())?;
     Ok(directory)
 }
 
@@ -929,11 +1019,18 @@ pub async fn run(
         );
     }
 
+    let mount_workspace = DlcMountWorkspace::new(&out_absolute)
+        .inspect_err(|error| eprintln!("could not prepare downloadable content workspace: {error}"))
+        .ok();
     let mut command = Command::new(wine);
     command
         .arg(&stub_path)
         .env("WINE_DLL_FILE_MAP", env_value)
         .env("WINE_EXE_FILE_MAP", exe_env_value);
+    command.env_remove(MOUNT_WORKSPACE_ENV);
+    if let Some(workspace) = &mount_workspace {
+        workspace.configure(&mut command);
+    }
     if offline {
         // The runtime treats the network as unreachable at once instead of
         // waiting for its own connect timeouts.
@@ -967,6 +1064,7 @@ pub async fn run(
         Err(err) => {
             eprintln!("failed to start Wine: {}", err);
             let _ = std::fs::remove_file(&stub_path);
+            drop(mount_workspace);
             drop(launch_mirror);
             cleanup().await;
             return ExitCode::FAILURE;
@@ -985,6 +1083,7 @@ pub async fn run(
     let status = wn.wait().await.unwrap();
 
     let _ = std::fs::remove_file(&stub_path);
+    drop(mount_workspace);
     drop(launch_mirror);
     cleanup().await;
 
@@ -996,6 +1095,90 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn dlc_workspace_is_private_and_sets_only_the_child_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game with spaces");
+        std::fs::create_dir(&game).unwrap();
+        std::fs::write(game.join("keep.bin"), b"original").unwrap();
+        let workspace = DlcMountWorkspace::new(&game).unwrap();
+        let view = workspace.view.as_ref().unwrap();
+        assert_eq!(std::fs::symlink_metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert!(mount_workspace_marker_matches(&view._lock.as_ref().unwrap()._file, &std::fs::metadata(view.path()).unwrap()));
+        let mut command = Command::new("true");
+        command.env(MOUNT_WORKSPACE_ENV, "inherited/foreign");
+        workspace.configure(&mut command);
+        let value = command.as_std().get_envs().find(|(key, _)| *key == MOUNT_WORKSPACE_ENV).unwrap().1.unwrap();
+        assert_eq!(value, std::ffi::OsStr::new(&format!("Z:{}", view.path().to_str().unwrap().replace('/', "\\"))));
+        let path = view.path().to_path_buf();
+        std::fs::write(path.join("readonly.bin"), b"copied").unwrap();
+        std::fs::set_permissions(path.join("readonly.bin"), std::fs::Permissions::from_mode(0o444)).unwrap();
+        symlink(&game, path.join("outside")).unwrap();
+        drop(workspace);
+        assert!(!path.exists());
+        assert!(!launch_view_lock_path(&path).exists());
+        assert_eq!(std::fs::read(game.join("keep.bin")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn dlc_workspace_keeps_live_descendants_then_sweeps_after_the_last_owner_exits() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        std::fs::write(path.join("content.bin"), b"private DLC").unwrap();
+        let mut child = std::process::Command::new("sh").args(["-c", "read -r line"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).spawn().unwrap();
+        drop(workspace);
+        assert!(path.exists() && launch_view_lock_path(&path).exists());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        child.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(sweep_stale_launch_views(root.path()), 1);
+        assert!(!path.exists() && !launch_view_lock_path(&path).exists());
+    }
+
+    #[test]
+    fn dlc_workspace_rejects_lockless_views_without_publishing_an_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = Builder::new().prefix(MOUNT_WORKSPACE_PREFIX).tempdir_in(root.path()).unwrap();
+        let path = directory.path().to_path_buf();
+        let view = LaunchView::with_lock(directory, |_| Err(std::io::Error::other("fixture: locks unavailable")));
+        let error = DlcMountWorkspace::from_view(view).err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dlc_workspace_sweep_rejects_missing_or_foreign_directory_markers() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, marker) in [(".xodus-mounts-unmarked", ""), ("xodus-mounts-foreign", "NXM1\n0\n0\n")] {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("keep.bin"), b"keep").unwrap();
+            std::fs::write(launch_view_lock_path(&path), marker).unwrap();
+        }
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert_eq!(std::fs::read(root.path().join(".xodus-mounts-unmarked/keep.bin")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(root.path().join("xodus-mounts-foreign/keep.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn dlc_workspace_never_removes_a_replacement_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = DlcMountWorkspace::new(&root.path().join("game")).unwrap();
+        let path = workspace.view.as_ref().unwrap().path().to_path_buf();
+        let moved = root.path().join("moved-owned-workspace");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.bin"), b"foreign").unwrap();
+        drop(workspace);
+        assert_eq!(std::fs::read(path.join("keep.bin")).unwrap(), b"foreign");
+        assert!(!launch_view_lock_path(&path).exists());
+        assert_eq!(sweep_stale_launch_views(root.path()), 0);
+        assert_eq!(std::fs::read(path.join("keep.bin")).unwrap(), b"foreign");
+    }
 
     #[tokio::test]
     async fn launch_image_preflight_rejects_incomplete_ciphertext_with_file_and_size_without_writing() {
@@ -1579,6 +1762,60 @@ mod tests {
         let directory = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", probe_launch_view_links).unwrap();
         assert_eq!(directory.path().parent(), Some(root.path()));
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_view_is_private_with_a_group_writable_umask() {
+        use std::os::unix::process::CommandExt;
+        const CHILD: &str = "NEXUS_TEST_PRIVATE_VIEW_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let root = tempfile::tempdir().unwrap();
+            let view = launch_view_directory(root.path().join("game").as_path(), ".xodus-chain-").unwrap();
+            assert_eq!(std::fs::metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "commands::run::tests::launch_view_is_private_with_a_group_writable_umask", "--nocapture"]);
+        child.env(CHILD, "1");
+        unsafe { child.pre_exec(|| { nix::libc::umask(0o002); Ok(()) }); }
+        let result = child.output().unwrap();
+        let output = format!("{}{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        assert!(result.status.success(), "{output}");
+        assert!(output.contains("1 passed"), "child must execute the private-view assertion: {output}");
+    }
+
+    #[test]
+    fn launch_directory_falls_back_if_filesystem_ignores_private_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let view = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |path| {
+            calls += 1;
+            if path.parent() == Some(root.path()) {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+            }
+            probe_launch_view_links(path)
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(view.path().parent(), Some(fallback.path()));
+        assert_eq!(std::fs::metadata(view.path()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn launch_directory_rejects_an_unsafe_fallback_and_cleans_both_views() {
+        let root = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let mut calls = 0;
+        let error = launch_view_directory_with(&root.path().join("game"), fallback.path(), ".xodus-chain-", |path| {
+            calls += 1;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775))?;
+            probe_launch_view_links(path)
+        }).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EPERM));
+        assert_eq!(calls, 2);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(fallback.path()).unwrap().count(), 0);
     }
 
