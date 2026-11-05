@@ -35,6 +35,7 @@ jobs:
       issues: write
       id-token: write
       actions: write
+      statuses: write
     steps:
       - name: Triage the failure
         id: triage
@@ -121,11 +122,33 @@ jobs:
                account per docs/dual-account.md. Do not weaken or delete tests unless one is clearly wrong.
             3. Commit with messages ending with " [claude-review] [ci-fix]" and push with `git push origin HEAD`.
                Never merge, never force-push, never touch secrets or tokens, never print tokens or account data.
+            Last, write your verdict to /tmp/claude-verdict. Write the single word `safe` only if the branch
+            merges cleanly into dual-account, every check you ran passes, you have no doubt about any change
+            (dual-account behaviour, account routing, upstream intent) and nothing is left for a human: the PR
+            is then merged automatically once the GitHub checks are green. Otherwise write `doubt: ` and the
+            reason in one short line, without account data; the owner will look.
             Write a short summary in French to /tmp/claude-summary.md: the cause, what you fixed, routing
             decisions, what is left for a human, and whether the PR looks safe to merge once the checks are green.
           claude_args: >-
             --max-turns 80
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(cargo clippy *),Bash(gh run view *),Bash(gh pr view *),Bash(gh pr diff *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(git rev-parse *),Bash(git ls-files *),Bash(ls *),Bash(head *),Bash(tail *),Bash(wc *),Bash(grep *),Bash(sort *),Bash(uniq *),Bash(cat *),Bash(sed -n *),Bash(diff *),Bash(find *),Bash(cd *)"
+      - name: Record Claude's verdict
+        # A commit status the auto-merge requires: success only when Claude wrote "safe".
+        if: always() && steps.triage.outputs.fix == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          git fetch -q origin "${{ env.BRANCH }}"
+          [ "$(git rev-parse FETCH_HEAD)" = "$head" ] || { echo "The branch moved past ${head:0:7}; no verdict."; exit 0; }
+          if [ "$(head -n1 /tmp/claude-verdict 2>/dev/null)" = safe ]; then
+            state=success; description="Claude: safe to merge"
+          else
+            state=failure; description=$(head -n1 /tmp/claude-verdict 2>/dev/null | cut -c1-120)
+            [ -n "$description" ] || description="Claude left no verdict"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$head" -f state="$state" -f context=claude/verdict -f description="$description" > /dev/null
+          echo "claude/verdict on ${head:0:7}: $state ($description)"
       - name: Report on the PR
         if: always() && steps.triage.outputs.fix == 'true'
         env:

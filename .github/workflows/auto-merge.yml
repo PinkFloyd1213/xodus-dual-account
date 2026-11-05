@@ -1,0 +1,65 @@
+# Merges the automatic sync PR into dual-account on its own, then deletes its
+# branch, only when every check on its head commit passed and Claude's
+# verdict (the claude/verdict status) is "safe". A doubt, a fix Claude could
+# not make, or a pending or failed check leaves the PR for the owner.
+name: Auto-merge sync PR
+
+on:
+  workflow_run:
+    workflows: [Dual-account, Claude PR check, Claude CI fix]
+    types: [completed]
+  # Safety net when an event was missed.
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: auto-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  actions: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Merge the sync PR when it is green and Claude is sure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The merge must be pushed by SYNC_TOKEN: a GITHUB_TOKEN merge starts no workflows (the patch export would not run).
+          MERGE_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          BRANCH: nexus-sync
+          REQUIRED: '["Dual-account"]'
+        run: |
+          set -euo pipefail
+          [ -n "$MERGE_TOKEN" ] || { echo "::notice::Auto-merge needs the SYNC_TOKEN secret."; exit 0; }
+          pr=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$BRANCH" --base dual-account --state open \
+            --json number,headRefOid,isDraft,mergeable --jq '.[0] // empty')
+          [ -n "$pr" ] || { echo "No open $BRANCH PR."; exit 0; }
+          number=$(jq -r .number <<<"$pr"); sha=$(jq -r .headRefOid <<<"$pr")
+          [ "$(jq -r .isDraft <<<"$pr")" = false ] || { echo "PR #$number is a draft."; exit 0; }
+          [ "$(jq -r .mergeable <<<"$pr")" = MERGEABLE ] || { echo "PR #$number does not merge cleanly yet."; exit 0; }
+          # Every check run and commit status on the head commit, latest of each.
+          checks=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" --paginate \
+            --jq '.check_runs[] | {name, status, conclusion}' | jq -s .)
+          statuses=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status" --jq '.statuses')
+          if jq -e 'any(.[]; .status != "completed")' <<<"$checks" > /dev/null; then echo "Checks still running on ${sha:0:7}."; exit 0; fi
+          if jq -e 'any(.[]; (.conclusion | IN("success","skipped","neutral")) | not)' <<<"$checks" > /dev/null; then
+            echo "A check failed on ${sha:0:7}:"; jq -r '.[] | select((.conclusion | IN("success","skipped","neutral")) | not) | "  \(.name): \(.conclusion)"' <<<"$checks"; exit 0
+          fi
+          if jq -e 'any(.[]; .state != "success")' <<<"$statuses" > /dev/null; then
+            echo "A status is not green on ${sha:0:7}:"; jq -r '.[] | select(.state != "success") | "  \(.context): \(.state) \(.description // "")"' <<<"$statuses"; exit 0
+          fi
+          jq -e 'any(.[]; .context == "claude/verdict" and .state == "success")' <<<"$statuses" > /dev/null \
+            || { echo "No Claude verdict on ${sha:0:7} yet."; exit 0; }
+          # The required workflows must have run on this commit, not merely be absent.
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$sha&event=pull_request&per_page=100" --jq '[.workflow_runs[].name]')
+          missing=$(jq -r --argjson runs "$runs" '. - $runs | join(", ")' <<<"$REQUIRED")
+          [ -z "$missing" ] || { echo "Not run on ${sha:0:7} yet: $missing."; exit 0; }
+          echo "PR #$number (${sha:0:7}) is green and Claude is sure: merging."
+          GH_TOKEN=$MERGE_TOKEN gh pr merge "$number" -R "$GITHUB_REPOSITORY" --merge --delete-branch --match-head-commit "$sha"

@@ -32,6 +32,7 @@ jobs:
       issues: write
       id-token: write
       actions: read
+      statuses: write
     steps:
       - name: Resolve the PR branch
         id: pr
@@ -116,7 +117,29 @@ jobs:
             Finish with a short summary in French for the owner: what changed in the recipe, what you fixed,
             routing decisions, what is left for a human, and whether it looks safe to merge (with a merge
             commit, not squash). After the merge, the patch is exported to the Nexus fork automatically.
+            Last, write your verdict to /tmp/claude-verdict. Write the single word `safe` only if the branch
+            merges cleanly into dual-account, every check you ran passes, you have no doubt about any change
+            (dual-account behaviour, account routing, upstream intent) and nothing is left for a human: the PR
+            is then merged automatically once the GitHub checks are green. Otherwise write `doubt: ` and the
+            reason in one short line, without account data; the owner will look.
             ${{ github.event_name == 'workflow_dispatch' && format('This run was started by hand: write the summary to /tmp/claude-summary.md and post it with `gh pr comment {0} -R {1} --body-file /tmp/claude-summary.md`.', steps.pr.outputs.number, github.repository) || '' }}
           claude_args: >-
             --max-turns 80
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(cargo build *),Bash(cargo test *),Bash(cargo check *),Bash(cargo fmt *),Bash(git status),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(git fetch *),Bash(git merge *),Bash(git add *),Bash(git commit *),Bash(git push origin HEAD),Bash(git config *),Bash(git checkout *),Bash(ls *),Bash(gh pr comment ${{ steps.pr.outputs.number }} -R ${{ github.repository }} --body-file /tmp/claude-summary.md),Bash(head *),Bash(tail *),Bash(wc *),Bash(grep *),Bash(sort *),Bash(uniq *),Bash(cat *),Bash(sed -n *),Bash(diff *),Bash(find *),Bash(sha256sum *),Bash(git rev-parse *),Bash(git branch *),Bash(git remote *),Bash(git -C /tmp/*),Bash(git clone *),Bash(git ls-files *),Bash(git apply --check *),Bash(cd *)"
+      - name: Record Claude's verdict
+        # A commit status the auto-merge requires: success only when Claude wrote "safe".
+        if: always() && env.HAS_CLAUDE_TOKEN == 'true' && steps.own.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          git fetch -q origin "${{ steps.pr.outputs.head }}"
+          [ "$(git rev-parse FETCH_HEAD)" = "$head" ] || { echo "The branch moved past ${head:0:7}; no verdict."; exit 0; }
+          if [ "$(head -n1 /tmp/claude-verdict 2>/dev/null)" = safe ]; then
+            state=success; description="Claude: safe to merge"
+          else
+            state=failure; description=$(head -n1 /tmp/claude-verdict 2>/dev/null | cut -c1-120)
+            [ -n "$description" ] || description="Claude left no verdict"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$head" -f state="$state" -f context=claude/verdict -f description="$description" > /dev/null
+          echo "claude/verdict on ${head:0:7}: $state ($description)"
